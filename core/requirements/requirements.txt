@@ -1,4 +1,6 @@
-requests
-urllib3
-colorama
-tqdm
+requests>=2.31.0
+urllib3>=2.0.0
+colorama>=0.4.6
+tqdm>=4.66.0
+python-whois>=0.8.0
+aiodns>=3.1.0
