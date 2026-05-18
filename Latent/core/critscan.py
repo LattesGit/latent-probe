@@ -1,5 +1,5 @@
 
-smb_critical_scanner = '''#!/usr/bin/env python3
+#!/usr/bin/env python3
 import socket
 import subprocess
 import sys
