@@ -91,7 +91,7 @@ COMMON_DIRS = [
     "/internal", "/intranet"
 ]
 
-# FIXED: Raw strings ile XSS payload'lar - escape karakter sorunu cozuldu
+# FIXED: Raw strings ile XSS payload buarada bunu yapay zeka yazmadı .-.
 XSS_PAYLOADS = [
     r"<script>alert(1)</script>",
     r"<script>alert(document.domain)</script>",
@@ -1176,8 +1176,8 @@ def main():
 
     print(f"""
 {Fore.CYAN}===============================================================
-                     LATENT - IM JUST A ANONYMOUS
-                         v0.3.0 | Multi-Phase
+                     LATENT - PROBE TOOL
+                         discord : @itzlatent
 ===============================================================
 {Style.RESET_ALL}""")
 
