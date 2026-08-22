@@ -14,10 +14,11 @@ from datetime import datetime
 from urllib.parse import urlparse, urljoin, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+import logging
+import traceback
 
 import requests
 import urllib3
-from colorama import Fore, Style, init
 
 try:
     from tqdm import tqdm
@@ -56,11 +57,11 @@ except ImportError:
     jwt = None
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-init(autoreset=True)
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
 HEADERS = {"User-Agent": USER_AGENT}
 TIMEOUT = 10
+VERSION = "0.3.0"
 
 COMMON_DIRS = [
     "/admin", "/admin/login", "/admin.php", "/administrator",
@@ -75,111 +76,91 @@ COMMON_DIRS = [
     "/backup", "/backups", "/backup.zip", "/site.zip",
     "/dump.sql", "/database.sql", "/db.sql",
     "/wp-admin", "/wp-login.php", "/wp-content",
-    "/administrator", "/joomla", "/user/login",
+    "/joomla", "/user/login",
     "/phpmyadmin", "/pma", "/mysql",
     "/server-status", "/status",
     "/dev", "/development", "/staging", "/test",
-    "/testing", "/old", "/beta", "/demo",
-    "/console", "/shell", "/terminal",
     "/upload", "/uploads", "/files",
     "/tmp", "/temp",
     "/robots.txt", "/sitemap.xml",
     "/crossdomain.xml", "/security.txt",
-    "/jenkins", "/gitlab", "/ci", "/ci/cd",
+    "/jenkins", "/gitlab", "/ci",
     "/kibana", "/grafana", "/prometheus",
     "/hidden", "/secret", "/private",
     "/internal", "/intranet"
 ]
 
-# FIXED: Raw strings ile XSS payload buarada bunu yapay zeka yazmadı .-.
 XSS_PAYLOADS = [
     r"<script>alert(1)</script>",
     r"<script>alert(document.domain)</script>",
-    r"<script>confirm(1)</script>",
-    r"<script>prompt(1)</script>",
-    r'\"><script>alert(1)</script>',
-    r"'><script>alert(1)</script>",
-    r"</script><script>alert(1)</script>",
-    r"</title><script>alert(1)</script>",
     r"<img src=x onerror=alert(1)>",
-    r"<img src=invalid onerror=confirm(1)>",
-    r"<img src=x onerror=prompt(1)>",
     r"<svg onload=alert(1)>",
-    r"<svg/onload=alert(1)>",
-    r"<svg><script>alert(1)</script></svg>",
-    r"<body onload=alert(1)>",
-    r"<body onmouseover=alert(1)>",
-    r"<div onmouseover=alert(1)>X</div>",
-    r"<input onfocus=alert(1) autofocus>",
     r"javascript:alert(1)",
-    r"javascript:confirm(1)",
-    r"javascript:prompt(1)",
     r'" onmouseover=alert(1) x="',
     r"' onmouseover=alert(1) x='",
-    r'" autofocus onfocus=alert(1) x="',
     r"%3Cscript%3Ealert(1)%3C/script%3E",
     r"%3Cimg%20src=x%20onerror=alert(1)%3E",
-    r"&lt;script&gt;alert(1)&lt;/script&gt;",
-    r"'\"><svg/onload=alert(1)>",
-    r'\"><img/src=x/onerror=alert(1)>',
-    r'\"><iframe src=javascript:alert(1)>',
-    r"${alert(1)}",
-    r"{{alert(1)}}",
-    r"<%= alert(1) %>",
-    r"<script>document.body.innerHTML='XSS'</script>",
-    r"<script>eval('alert(1)')</script>"
+    r'"><script>alert(1)</script>',
+    r"'><script>alert(1)</script>",
 ]
 
-LOGIN_PATHS = [
-    "/login", "/admin", "/wp-login.php", "/administrator",
-    "/user/login", "/signin", "/auth", "/panel"
-]
+LOGIN_PATHS = ["/login", "/admin", "/wp-login.php", "/administrator", "/user/login", "/signin", "/auth"]
 
 COMMON_USERS = ["admin", "root", "user", "test", "administrator", "guest"]
 
 CORS_TEST_ORIGINS = [
-    "https://evil.com",
-    "http://evil.com",
-    "null",
-    "https://attacker.com",
-    "http://localhost",
-    "https://localhost",
-    "http://127.0.0.1",
-    "https://127.0.0.1"
+    "https://evil.com", "http://evil.com", "null",
+    "https://attacker.com", "http://localhost", "https://localhost",
+    "http://127.0.0.1", "https://127.0.0.1"
 ]
 
 JWT_COMMON_SECRETS = [
     "secret", "secret123", "password", "123456", "admin",
-    "jwt", "token", "key", "supersecret", "changeme",
-    "default", "password123", "secretkey", "auth",
-    "jwtsecret", "token123", "key123", "supersecretkey"
+    "jwt", "token", "key", "supersecret", "changeme"
 ]
 
 
 class Logger:
-    def __init__(self, report_file=None):
+    def __init__(self, report_file=None, verbose=False):
         self.report_file = report_file
+        self.verbose = verbose
+        self.errors = []
+        self.warnings = []
 
     def log(self, msg, level="INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
-        color = {
-            "INFO": Fore.CYAN,
-            "WARN": Fore.YELLOW,
-            "FAIL": Fore.RED,
-            "OK": Fore.GREEN,
-            "PHASE": Fore.MAGENTA
-        }.get(level, Fore.WHITE)
-        line = f"[{ts}] [{level}] {msg}"
-        print(f"{color}{line}{Style.RESET_ALL}")
+        prefixes = {"INFO": "[*]", "OK": "[+]", "WARN": "[!]", "ERROR": "[X]", "DEBUG": "[D]"}
+        prefix = prefixes.get(level, "[*]")
+        line = f"{ts} {prefix} {msg}"
+        print(line)
         if self.report_file:
             self.report_file.write(line + "\n")
+        if level == "ERROR":
+            self.errors.append(msg)
+        elif level == "WARN":
+            self.warnings.append(msg)
 
     def phase(self, text):
-        print(f"\n{Fore.MAGENTA}{'='*60}{Style.RESET_ALL}")
-        print(f"  {Fore.MAGENTA}{text}{Style.RESET_ALL}")
-        print(f"{Fore.MAGENTA}{'='*60}{Style.RESET_ALL}")
+        print(f"\n{'='*70}")
+        print(f"  {text}")
+        print(f"{'='*70}")
         if self.report_file:
-            self.report_file.write(f"\n{'='*60}\n  {text}\n{'='*60}\n")
+            self.report_file.write(f"\n{'='*70}\n  {text}\n{'='*70}\n")
+
+    def error(self, msg, exc=None):
+        self.log(msg, "ERROR")
+        if exc and self.verbose:
+            traceback.print_exc()
+
+    def warn(self, msg):
+        self.log(msg, "WARN")
+
+    def ok(self, msg):
+        self.log(msg, "OK")
+
+    def debug(self, msg):
+        if self.verbose:
+            self.log(msg, "DEBUG")
 
 
 class RateLimiter:
@@ -192,6 +173,26 @@ class RateLimiter:
         if elapsed < self.delay:
             time.sleep(self.delay - elapsed)
         self.last = time.time()
+
+
+def safe_request(session, url, method="GET", **kwargs):
+    try:
+        kwargs.setdefault("timeout", TIMEOUT)
+        kwargs.setdefault("headers", HEADERS)
+        if method.upper() == "GET":
+            return session.get(url, **kwargs)
+        elif method.upper() == "POST":
+            return session.post(url, **kwargs)
+        elif method.upper() == "HEAD":
+            return session.head(url, **kwargs)
+        else:
+            return session.request(method, url, **kwargs)
+    except requests.exceptions.Timeout:
+        return None
+    except requests.exceptions.ConnectionError:
+        return None
+    except Exception:
+        return None
 
 
 def resolve_domain(target):
@@ -207,28 +208,29 @@ def resolve_domain(target):
 
 
 def fetch_html(domain, logger, session):
-    logger.phase("PHASE 1: HTML FETCH & TECH FINGERPRINT")
-    variants = [f"http://{domain}", f"https://{domain}",
-                f"http://www.{domain}", f"https://www.{domain}"]
+    logger.phase("HTML FETCH & FINGERPRINT")
+    variants = [f"http://{domain}", f"https://{domain}", f"http://www.{domain}", f"https://www.{domain}"]
 
     for url in variants:
         try:
-            logger.log(f"Trying {url} ...")
-            r = session.get(url, timeout=TIMEOUT, headers=HEADERS)
-            logger.log(f"HTTP {r.status_code} - {len(r.text)} bytes", "OK")
+            logger.log(f"Trying {url}")
+            r = safe_request(session, url)
+            if r is None:
+                continue
+            logger.ok(f"HTTP {r.status_code} - {len(r.text)} bytes")
 
             path = f"{domain}_index.html"
             with open(path, "w", encoding="utf-8") as f:
                 f.write(r.text)
-            logger.log(f"Saved: {path}", "OK")
+            logger.ok(f"Saved: {path}")
 
             tech = fingerprint_tech(r)
-            logger.log(f"Tech: {tech}")
+            logger.log(f"Technology: {json.dumps(tech, indent=2)}")
             return r.text, path, tech
         except Exception as e:
-            logger.log(f"Failed: {url} -> {e}", "WARN")
+            logger.error(f"Failed: {url} -> {e}")
 
-    logger.log("HTML fetch failed.", "FAIL")
+    logger.error("HTML fetch failed.")
     return None, None, {}
 
 
@@ -248,30 +250,21 @@ def fingerprint_tech(response):
         tech["missing_headers"] = missing
 
     txt = response.text.lower()
-    if "wp-content" in txt or "wordpress" in txt:
-        tech["cms"] = "WordPress"
-    elif "drupal" in txt:
-        tech["cms"] = "Drupal"
-    elif "joomla" in txt:
-        tech["cms"] = "Joomla"
-    elif "django" in txt:
-        tech["cms"] = "Django"
-    elif "laravel" in txt:
-        tech["cms"] = "Laravel"
-    elif "rails" in txt or "ruby on rails" in txt:
-        tech["cms"] = "Ruby on Rails"
-    elif "spring" in txt:
-        tech["cms"] = "Spring"
-    elif "express" in txt:
-        tech["cms"] = "Express.js"
-    elif "next.js" in txt or "_next" in txt:
-        tech["cms"] = "Next.js"
-    elif "react" in txt:
-        tech["framework"] = "React"
-    elif "vue" in txt:
-        tech["framework"] = "Vue.js"
-    elif "angular" in txt:
-        tech["framework"] = "Angular"
+    cms_patterns = {
+        "wordpress": "WordPress",
+        "drupal": "Drupal",
+        "joomla": "Joomla",
+        "django": "Django",
+        "laravel": "Laravel",
+        "rails": "Ruby on Rails",
+        "spring": "Spring",
+        "express": "Express.js",
+        "_next": "Next.js"
+    }
+    for pattern, name in cms_patterns.items():
+        if pattern in txt:
+            tech["cms"] = name
+            break
 
     js_libs = []
     if "jquery" in txt:
@@ -280,19 +273,15 @@ def fingerprint_tech(response):
         js_libs.append("Bootstrap")
     if "axios" in txt:
         js_libs.append("Axios")
-    if "fetch(" in txt:
-        js_libs.append("Fetch API")
-    if "websocket" in txt or "ws://" in txt:
-        js_libs.append("WebSocket")
     if js_libs:
         tech["js_libraries"] = js_libs
 
     api_patterns = re.findall(r'["\']((?:/api|/graphql|/rest|/v\d+)[^"\'\s]*)["\']', response.text, re.IGNORECASE)
     if api_patterns:
-        tech["api_endpoints_in_html"] = list(set(api_patterns[:20]))
+        tech["api_endpoints"] = list(set(api_patterns[:20]))
 
     if "authorization" in txt or "jwt" in txt or "bearer" in txt:
-        tech["jwt_detected"] = True
+        tech["auth_detected"] = True
 
     cors_headers = {}
     for hdr in ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Allow-Credentials"]:
@@ -316,12 +305,12 @@ def scan_port_single(args):
                     svc = "unknown"
                 return (port, svc)
     except Exception:
-        pass
+        return None
     return None
 
 
 def scan_ports(domain, max_port, logger, threads=150):
-    logger.phase("PHASE 2: PORT SCAN")
+    logger.phase("PORT SCAN")
     open_ports = []
     ports = list(range(1, max_port + 1))
 
@@ -329,21 +318,21 @@ def scan_ports(domain, max_port, logger, threads=150):
         futures = {ex.submit(scan_port_single, (domain, p)): p for p in ports}
         iterator = as_completed(futures)
         if tqdm:
-            iterator = tqdm(iterator, total=len(ports), desc="Ports", ncols=70)
+            iterator = tqdm(iterator, total=len(ports), desc="Scanning ports", ncols=70)
 
         for f in iterator:
             res = f.result()
             if res:
                 port, svc = res
-                logger.log(f"OPEN {port}/{svc}", "OK")
+                logger.ok(f"OPEN {port}/{svc}")
                 open_ports.append(res)
 
-    logger.log(f"Found {len(open_ports)} open ports")
+    logger.ok(f"Found {len(open_ports)} open ports")
     return sorted(open_ports)
 
 
 def smb_probe(domain, logger):
-    logger.phase("PHASE 3: SMB PROBE")
+    logger.phase("SMB PROBE")
     smb_ports = [139, 445]
     found = []
     for port in smb_ports:
@@ -351,45 +340,38 @@ def smb_probe(domain, logger):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2)
                 if s.connect_ex((domain, port)) == 0:
-                    logger.log(f"SMB port {port} OPEN", "OK")
+                    logger.ok(f"SMB port {port} OPEN")
                     found.append(port)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"SMB port {port} error: {e}")
 
     if found:
-        logger.log("SMB detected. Consider enum4linux.", "WARN")
+        logger.warn("SMB detected")
         try:
-            out = subprocess.run(
-                ["smbclient", "-L", f"//{domain}/", "-N"],
-                capture_output=True, text=True, timeout=10
-            )
+            out = subprocess.run(["smbclient", "-L", f"//{domain}/", "-N"], capture_output=True, text=True, timeout=10)
             if out.stdout:
-                logger.log("SMB shares retrieved")
+                logger.ok("SMB shares retrieved")
                 return out.stdout
         except Exception as e:
-            logger.log(f"smbclient failed: {e}", "WARN")
+            logger.error(f"smbclient failed: {e}")
     else:
         logger.log("SMB ports closed")
     return None
 
 
 def subdomain_sync(domain, wordlist, logger, limit):
-    logger.phase("PHASE 4: SUBDOMAIN ENUM (sync)")
+    logger.phase("SUBDOMAIN ENUM")
     found = []
-    count = 0
 
     try:
         with open(wordlist, "r", encoding="latin-1", errors="ignore") as f:
             subs = []
             for line in f:
                 sub = line.strip()
-                if (sub and not sub.startswith("#") and 
-                    sub.replace("-", "").replace("_", "").isalnum() and
-                    not sub.startswith(".") and not sub.endswith(".") and
-                    len(sub) > 0):
+                if sub and not sub.startswith("#"):
                     subs.append(sub)
     except Exception as e:
-        logger.log(f"Wordlist error: {e}", "FAIL")
+        logger.error(f"Wordlist error: {e}")
         return found
 
     if limit > 0:
@@ -397,24 +379,21 @@ def subdomain_sync(domain, wordlist, logger, limit):
 
     logger.log(f"Testing {len(subs)} subdomains...")
 
-    for sub in tqdm(subs, desc="Subdomains", ncols=70) if tqdm else subs:
+    for sub in (tqdm(subs, desc="Subdomains", ncols=70) if tqdm else subs):
         full = f"{sub}.{domain}"
         try:
             ip = socket.gethostbyname(full)
-            logger.log(f"FOUND {full} -> {ip}", "OK")
+            logger.ok(f"FOUND {full} -> {ip}")
             found.append((full, ip))
-            count += 1
         except (socket.gaierror, UnicodeEncodeError):
             pass
-        if limit > 0 and count >= limit:
-            break
 
-    logger.log(f"Total subdomains: {len(found)}")
+    logger.ok(f"Total subdomains: {len(found)}")
     return found
 
 
 async def subdomain_async(domain, wordlist, logger, limit):
-    logger.phase("PHASE 4: SUBDOMAIN ENUM (async)")
+    logger.phase("SUBDOMAIN ENUM (async)")
     found = []
     resolver = aiodns.DNSResolver()
 
@@ -423,13 +402,10 @@ async def subdomain_async(domain, wordlist, logger, limit):
             subs = []
             for line in f:
                 sub = line.strip()
-                if (sub and not sub.startswith("#") and 
-                    sub.replace("-", "").replace("_", "").isalnum() and
-                    not sub.startswith(".") and not sub.endswith(".") and
-                    len(sub) > 0):
+                if sub and not sub.startswith("#"):
                     subs.append(sub)
     except Exception as e:
-        logger.log(f"Wordlist error: {e}", "FAIL")
+        logger.error(f"Wordlist error: {e}")
         return found
 
     if limit > 0:
@@ -446,125 +422,109 @@ async def subdomain_async(domain, wordlist, logger, limit):
             return None
 
     tasks = [query(s) for s in subs]
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Subdomains") if tqdm else asyncio.as_completed(tasks):
+    for coro in (tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Subdomains") if tqdm else asyncio.as_completed(tasks)):
         res = await coro
         if res:
-            logger.log(f"FOUND {res[0]} -> {res[1]}", "OK")
+            logger.ok(f"FOUND {res[0]} -> {res[1]}")
             found.append(res)
 
-    logger.log(f"Total subdomains: {len(found)}")
+    logger.ok(f"Total subdomains: {len(found)}")
     return found
 
 
 def xss_probe(domain, logger, session, limiter):
-    logger.phase("PHASE 5: XSS PROBE")
-    pages = [
-        f"http://{domain}", f"https://{domain}",
-        f"http://{domain}/search", f"http://{domain}/contact",
-        f"http://{domain}/login"
-    ]
+    logger.phase("XSS PROBE")
+    pages = [f"http://{domain}", f"https://{domain}", f"http://{domain}/search", f"http://{domain}/contact"]
     hits = 0
+    total_tests = 0
 
     for page in pages:
         try:
             limiter.sleep()
-            r = session.get(page, timeout=5, headers=HEADERS)
-            if "<form" not in r.text.lower() and "input" not in r.text.lower():
+            r = safe_request(session, page)
+            if r is None or "<form" not in r.text.lower():
                 continue
 
             for payload in XSS_PAYLOADS:
                 try:
                     limiter.sleep()
+                    total_tests += 1
                     test = f"{page}?q={payload}&search={payload}&id={payload}"
-                    r2 = session.get(test, timeout=5, headers=HEADERS)
-                    if payload in r2.text:
-                        ctx = check_context(r2.text, payload)
-                        logger.log(f"XSS REFLECTED [{ctx}]: {test}", "WARN")
+                    r2 = safe_request(session, test)
+                    if r2 and payload in r2.text:
+                        logger.warn(f"XSS REFLECTED: {test}")
                         hits += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.debug(f"XSS test error: {e}")
+        except Exception as e:
+            logger.debug(f"XSS page error: {e}")
 
-    logger.log(f"XSS tests done. Reflected: {hits}")
+    logger.ok(f"XSS tests done. Total: {total_tests}, Reflected: {hits}")
     return hits
 
 
-def check_context(html, payload):
-    idx = html.find(payload)
-    if idx == -1:
-        return "none"
-    window = html[max(0, idx-40):idx+len(payload)+40]
-    if f"<script>{payload}" in window or f"<script>{payload}</script>" in window:
-        return "script"
-    if "=" in window and (window.count('"') % 2 == 1 or window.count("'") % 2 == 1):
-        return "attr"
-    return "html"
-
-
 def sqlmap_probe(domain, logger):
-    logger.phase("PHASE 6: SQLMAP INTEGRATION")
+    logger.phase("SQLMAP INTEGRATION")
     targets = [f"http://{domain}", f"https://{domain}"]
+    vulnerable = False
 
     for url in targets:
         logger.log(f"SQLMap -> {url}")
-        cmd = [
-            "sqlmap", "-u", url, "--batch", "--random-agent",
-            "--level", "2", "--risk", "2", "--threads", "4",
-            "--time-sec", "5", "--output-dir", f"./sqlmap_{domain}",
-            "--tamper", "space2comment"
-        ]
+        cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level", "2", "--risk", "2", "--threads", "4", "--time-sec", "5", "--output-dir", f"./sqlmap_{domain}"]
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if out.stdout:
                 with open(f"{domain}_sqlmap.txt", "w") as f:
                     f.write(out.stdout)
                 if "vulnerable" in out.stdout.lower() or "injectable" in out.stdout.lower():
-                    logger.log("SQL INJECTION DETECTED!", "FAIL")
-                    return True
-                logger.log("No obvious SQLi found")
-                return False
+                    logger.error("SQL INJECTION DETECTED!")
+                    vulnerable = True
+                else:
+                    logger.log("No obvious SQLi found")
         except subprocess.TimeoutExpired:
-            logger.log("SQLMap timeout", "WARN")
+            logger.warn("SQLMap timeout")
         except FileNotFoundError:
-            logger.log("sqlmap not installed", "FAIL")
+            logger.error("sqlmap not installed")
         except Exception as e:
-            logger.log(f"SQLMap error: {e}", "WARN")
-    return False
+            logger.error(f"SQLMap error: {e}")
+    return vulnerable
 
 
 def dir_fuzz(domain, logger, session, limiter):
-    logger.phase("PHASE 7: DIRECTORY FUZZING")
+    logger.phase("DIRECTORY FUZZING")
     found = []
     for path in COMMON_DIRS:
         for proto in ["http", "https"]:
             url = f"{proto}://{domain}{path}"
             try:
                 limiter.sleep()
-                r = session.get(url, timeout=8, headers=HEADERS, allow_redirects=False)
-                if r.status_code in (200, 301, 302, 401, 403):
-                    logger.log(f"[{r.status_code}] {url}", "OK" if r.status_code == 200 else "WARN")
+                r = safe_request(session, url, allow_redirects=False)
+                if r and r.status_code in (200, 301, 302, 401, 403):
+                    status = "OK" if r.status_code == 200 else "WARN"
+                    logger.log(f"[{r.status_code}] {url}", status)
                     found.append((url, r.status_code, len(r.text)))
-            except Exception:
-                pass
-    logger.log(f"Found {len(found)} interesting paths")
+            except Exception as e:
+                logger.debug(f"Dir fuzz error: {e}")
+    logger.ok(f"Found {len(found)} interesting paths")
     return found
 
 
 def brute_login(domain, wordlist, logger, session, limiter):
-    logger.phase("PHASE 8: LOGIN BRUTE-FORCE")
+    logger.phase("LOGIN BRUTE-FORCE")
     try:
         with open(wordlist, "r", encoding="latin-1", errors="ignore") as f:
             passwords = [line.strip() for line in f if line.strip()][:100]
     except Exception:
-        passwords = ["123456", "123456789", "1234", "12345", "12345678", "password", "password1", "passw0rd", "pass123", "admin", "admin123", "administrator", "root", "toor", "guest", "qwerty", "qwerty123", "qwerty1", "asdfgh", "zxcvbn", "1q2w3e4r", "1q2w3e", "qwertyuiop", "111111", "000000", "121212", "123123", "654321", "7777777", "987654321", "112233", "letmein", "welcome", "login", "changeme", "default", "secret", "access", "test", "test123", "adminadmin", "admin1", "admin1234", "root123", "toor123", "ubuntu", "debian", "linux", "oracle", "mysql", "password123", "admin2024", "admin2025", "rootroot", "pass1234", "welcome123", "login123", "ctf123", "hackthebox", "tryhackme", "pentest", "security"]
+        passwords = ["123456", "password", "admin", "admin123", "root", "toor", "guest", "qwerty", "welcome", "changeme", "default", "secret", "test", "test123"]
 
     candidates = []
     for path in LOGIN_PATHS:
         url = f"http://{domain}{path}"
         try:
             limiter.sleep()
-            baseline = session.get(url, timeout=5, headers=HEADERS)
+            baseline = safe_request(session, url)
+            if baseline is None:
+                continue
             base_len = len(baseline.text)
         except Exception:
             continue
@@ -574,15 +534,17 @@ def brute_login(domain, wordlist, logger, session, limiter):
                 try:
                     limiter.sleep()
                     data = {"username": user, "password": pwd, "log": user, "pwd": pwd}
-                    r = session.post(url, data=data, timeout=5, headers=HEADERS, allow_redirects=False)
+                    r = safe_request(session, url, method="POST", data=data, allow_redirects=False)
+                    if r is None:
+                        continue
 
                     if is_success(r, base_len):
-                        logger.log(f"CREDENTIALS? {user}:{pwd} @ {url}", "WARN")
+                        logger.warn(f"CREDENTIALS? {user}:{pwd} @ {url}")
                         candidates.append((url, user, pwd))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Brute test error: {e}")
 
-    logger.log(f"Brute-force finished. Candidates: {len(candidates)}")
+    logger.ok(f"Brute-force finished. Candidates: {len(candidates)}")
     return candidates
 
 
@@ -599,31 +561,30 @@ def is_success(response, baseline_len):
 
 
 def whois_lookup(domain, logger):
-    logger.phase("PHASE 9: WHOIS")
+    logger.phase("WHOIS")
     if not whois:
-        logger.log("python-whois not installed", "WARN")
+        logger.warn("python-whois not installed")
         return None
     try:
         w = whois.whois(domain)
-        logger.log(f"Registrar: {w.registrar}")
-        logger.log(f"Creation: {w.creation_date}")
-        logger.log(f"Emails: {w.emails}")
+        logger.ok(f"Registrar: {w.registrar}")
+        logger.ok(f"Creation: {w.creation_date}")
+        logger.ok(f"Emails: {w.emails}")
         return {
             "registrar": str(w.registrar),
             "creation": str(w.creation_date),
             "emails": str(w.emails)
         }
     except Exception as e:
-        logger.log(f"WHOIS failed: {e}", "WARN")
+        logger.error(f"WHOIS failed: {e}")
         return None
 
 
 def recursive_crawl(domain, logger, session, limiter, max_depth=2, max_pages=50):
-    logger.phase("PHASE 10: RECURSIVE CRAWLER")
+    logger.phase("RECURSIVE CRAWLER")
 
     if not BS4_AVAILABLE:
-        logger.log("BeautifulSoup4 not installed. Skipping crawler.", "WARN")
-        logger.log("Install: pip install beautifulsoup4", "INFO")
+        logger.warn("BeautifulSoup4 not installed. Skipping crawler.")
         return []
 
     base_urls = [f"http://{domain}", f"https://{domain}"]
@@ -643,9 +604,8 @@ def recursive_crawl(domain, logger, session, limiter, max_depth=2, max_pages=50)
 
         try:
             limiter.sleep()
-            r = session.get(url, timeout=5, headers=HEADERS)
-
-            if "text/html" not in r.headers.get("Content-Type", ""):
+            r = safe_request(session, url)
+            if r is None or "text/html" not in r.headers.get("Content-Type", ""):
                 continue
 
             soup = BeautifulSoup(r.text, "html.parser")
@@ -655,23 +615,23 @@ def recursive_crawl(domain, logger, session, limiter, max_depth=2, max_pages=50)
                 if href:
                     full_url = urljoin(url, href)
                     parsed = urlparse(full_url)
-                    if parsed.netloc == domain or parsed.netloc == f"www.{domain}" or parsed.netloc == "":
+                    if parsed.netloc in (domain, f"www.{domain}", ""):
                         if full_url not in visited:
                             queue.append((full_url, depth + 1))
                             found_urls.append(full_url)
 
-            logger.log(f"Crawled [{r.status_code}] {url} | Found {len(found_urls)} links")
+            logger.debug(f"Crawled [{r.status_code}] {url} | Found {len(found_urls)} links")
 
         except Exception as e:
-            pass
+            logger.debug(f"Crawl error: {e}")
 
     unique_urls = list(set(found_urls))
-    logger.log(f"Crawl complete. Total unique URLs: {len(unique_urls)}")
+    logger.ok(f"Crawl complete. Total unique URLs: {len(unique_urls)}")
     return unique_urls
 
 
 def extract_js_endpoints(domain, logger, session, limiter, crawled_urls):
-    logger.phase("PHASE 11: JS ENDPOINT EXTRACTOR")
+    logger.phase("JS ENDPOINT EXTRACTOR")
 
     endpoints = set()
     js_files = []
@@ -681,32 +641,31 @@ def extract_js_endpoints(domain, logger, session, limiter, crawled_urls):
             js_files.append(url)
 
     if not js_files:
-        logger.log("No JS files found in crawl. Trying direct fetch...", "WARN")
+        logger.warn("No JS files found in crawl. Trying direct fetch...")
         for proto in ["http", "https"]:
             try:
                 limiter.sleep()
-                r = session.get(f"{proto}://{domain}", timeout=5, headers=HEADERS)
-                soup = BeautifulSoup(r.text, "html.parser") if BS4_AVAILABLE else None
-                if soup:
-                    for script in soup.find_all("script", src=True):
-                        src = urljoin(f"{proto}://{domain}", script["src"])
-                        if ".js" in src:
-                            js_files.append(src)
-            except:
-                pass
+                r = safe_request(session, f"{proto}://{domain}")
+                if r is None or not BS4_AVAILABLE:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                for script in soup.find_all("script", src=True):
+                    src = urljoin(f"{proto}://{domain}", script["src"])
+                    if ".js" in src:
+                        js_files.append(src)
+            except Exception as e:
+                logger.debug(f"JS fetch error: {e}")
 
     endpoint_patterns = [
         r'["\']((?:/api|/graphql|/rest|/v\d+|/auth|/admin|/user|/login|/logout|/register|/upload|/download|/search|/config)[^"\'\s]*)["\']',
         r'(?:url|endpoint|path|route|baseURL)\s*[:=]\s*["\']([^"\']+)["\']',
-        r'(?:GET|POST|PUT|DELETE|PATCH)\s+["\']([^"\']+)["\']',
         r'fetch\(["\']([^"\']+)["\']',
         r'axios\.(?:get|post|put|delete)\(["\']([^"\']+)["\']',
-        r'\.then\(.*?\)\s*\.get\(["\']([^"\']+)["\']',
         r'["\']((?:ws://|wss://)[^"\']+)["\']',
     ]
 
     secret_patterns = [
-        r'(?:api[_-]?key|apikey|token|secret|password|passwd|pwd)\s*[:=]\s*["\']([^"\']{8,})["\']',
+        r'(?:api[_-]?key|apikey|token|secret|password|passwd)\s*[:=]\s*["\']([^"\']{8,})["\']',
         r'(?:aws_access_key_id|aws_secret_access_key)\s*[:=]\s*["\']([^"\']+)["\']',
         r'(?:private[_-]?key|secret[_-]?key)\s*[:=]\s*["\']([^"\']+)["\']',
     ]
@@ -714,7 +673,9 @@ def extract_js_endpoints(domain, logger, session, limiter, crawled_urls):
     for js_url in js_files[:20]:
         try:
             limiter.sleep()
-            r = session.get(js_url, timeout=10, headers=HEADERS)
+            r = safe_request(session, js_url)
+            if r is None:
+                continue
             js_content = r.text
 
             for pattern in endpoint_patterns:
@@ -729,22 +690,22 @@ def extract_js_endpoints(domain, logger, session, limiter, crawled_urls):
                 secrets_found.extend(matches)
 
             if secrets_found:
-                logger.log(f"SECRETS in {js_url}: {len(secrets_found)} potential leaks", "WARN")
+                logger.warn(f"SECRETS in {js_url}: {len(secrets_found)} potential leaks")
                 for secret in secrets_found[:3]:
-                    logger.log(f"  -> {secret[:50]}...", "WARN")
+                    logger.warn(f"  -> {secret[:50]}...")
 
-            logger.log(f"Parsed {js_url} | Endpoints: {len(endpoints)}")
+            logger.debug(f"Parsed {js_url} | Endpoints: {len(endpoints)}")
 
         except Exception as e:
-            pass
+            logger.debug(f"JS parse error: {e}")
 
     endpoints_list = sorted(list(endpoints))
-    logger.log(f"Total unique endpoints found: {len(endpoints_list)}")
+    logger.ok(f"Total unique endpoints found: {len(endpoints_list)}")
     return endpoints_list
 
 
 def cors_check(domain, logger, session, limiter):
-    logger.phase("PHASE 12: CORS MISCONFIGURATION CHECKS")
+    logger.phase("CORS MISCONFIGURATION CHECKS")
 
     findings = []
     test_urls = [f"http://{domain}", f"https://{domain}"]
@@ -753,73 +714,48 @@ def cors_check(domain, logger, session, limiter):
         for origin in CORS_TEST_ORIGINS:
             try:
                 limiter.sleep()
-                headers = {
-                    "Origin": origin,
-                    "User-Agent": USER_AGENT
-                }
-                r = session.get(base_url, timeout=5, headers=headers)
+                headers = {"Origin": origin, "User-Agent": USER_AGENT}
+                r = safe_request(session, base_url, headers=headers)
+                if r is None:
+                    continue
 
                 acao = r.headers.get("Access-Control-Allow-Origin", "")
                 acac = r.headers.get("Access-Control-Allow-Credentials", "")
 
                 if acao == "*" and acac.lower() == "true":
-                    logger.log(f"CRITICAL: Wildcard + Credentials on {base_url} with Origin: {origin}", "FAIL")
-                    findings.append({
-                        "url": base_url,
-                        "origin": origin,
-                        "severity": "CRITICAL",
-                        "issue": "Access-Control-Allow-Origin: * with credentials enabled"
-                    })
+                    logger.error(f"CRITICAL: Wildcard + Credentials on {base_url}")
+                    findings.append({"url": base_url, "origin": origin, "severity": "CRITICAL", "issue": "Wildcard with credentials"})
                 elif acao == origin:
                     if acac.lower() == "true":
-                        logger.log(f"HIGH: Reflecting origin with credentials: {origin} -> {base_url}", "WARN")
-                        findings.append({
-                            "url": base_url,
-                            "origin": origin,
-                            "severity": "HIGH",
-                            "issue": "Origin reflected with credentials"
-                        })
+                        logger.warn(f"HIGH: Reflecting origin with credentials: {origin}")
+                        findings.append({"url": base_url, "origin": origin, "severity": "HIGH", "issue": "Origin reflected with credentials"})
                     else:
-                        logger.log(f"MEDIUM: Reflecting origin without credentials: {origin} -> {base_url}", "WARN")
-                        findings.append({
-                            "url": base_url,
-                            "origin": origin,
-                            "severity": "MEDIUM",
-                            "issue": "Origin reflected without credentials"
-                        })
+                        logger.warn(f"MEDIUM: Reflecting origin without credentials: {origin}")
+                        findings.append({"url": base_url, "origin": origin, "severity": "MEDIUM", "issue": "Origin reflected without credentials"})
                 elif acao == "*":
-                    logger.log(f"LOW: Wildcard CORS on {base_url}", "WARN")
-                    findings.append({
-                        "url": base_url,
-                        "origin": origin,
-                        "severity": "LOW",
-                        "issue": "Access-Control-Allow-Origin: *"
-                    })
+                    logger.warn(f"LOW: Wildcard CORS on {base_url}")
+                    findings.append({"url": base_url, "origin": origin, "severity": "LOW", "issue": "Wildcard CORS"})
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"CORS test error: {e}")
 
-    logger.log(f"CORS checks complete. Findings: {len(findings)}")
+    logger.ok(f"CORS checks complete. Findings: {len(findings)}")
     return findings
 
 
 def jwt_analyze(domain, logger, session, limiter):
-    logger.phase("PHASE 13: JWT ANALYZER")
+    logger.phase("JWT ANALYZER")
 
     if not JWT_AVAILABLE:
-        logger.log("PyJWT not installed. Skipping JWT analysis.", "WARN")
-        logger.log("Install: pip install pyjwt", "INFO")
+        logger.warn("PyJWT not installed. Skipping JWT analysis.")
         return []
 
     findings = []
 
     jwt_locations = [
-        f"http://{domain}",
-        f"https://{domain}",
-        f"http://{domain}/api",
-        f"https://{domain}/api",
-        f"http://{domain}/login",
-        f"https://{domain}/login",
+        f"http://{domain}", f"https://{domain}",
+        f"http://{domain}/api", f"https://{domain}/api",
+        f"http://{domain}/login", f"https://{domain}/login",
     ]
 
     collected_tokens = []
@@ -827,7 +763,9 @@ def jwt_analyze(domain, logger, session, limiter):
     for url in jwt_locations:
         try:
             limiter.sleep()
-            r = session.get(url, timeout=5, headers=HEADERS)
+            r = safe_request(session, url)
+            if r is None:
+                continue
 
             jwt_pattern = r'eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'
             tokens = re.findall(jwt_pattern, r.text)
@@ -842,8 +780,8 @@ def jwt_analyze(domain, logger, session, limiter):
             if auth_header.startswith("Bearer eyJ"):
                 collected_tokens.append(auth_header.replace("Bearer ", ""))
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"JWT fetch error: {e}")
 
     unique_tokens = list(set(collected_tokens))
 
@@ -852,7 +790,7 @@ def jwt_analyze(domain, logger, session, limiter):
             header = jwt.get_unverified_header(token)
             payload = jwt.decode(token, options={"verify_signature": False})
 
-            logger.log(f"JWT Found: alg={header.get('alg', 'unknown')}")
+            logger.ok(f"JWT Found: alg={header.get('alg', 'unknown')}")
             logger.log(f"  Payload keys: {list(payload.keys())}")
 
             token_findings = {
@@ -863,14 +801,14 @@ def jwt_analyze(domain, logger, session, limiter):
             }
 
             if header.get("alg") == "none":
-                logger.log("CRITICAL: JWT uses 'none' algorithm!", "FAIL")
+                logger.error("CRITICAL: JWT uses 'none' algorithm!")
                 token_findings["issues"].append("none_algorithm")
 
             if header.get("alg") in ["HS256", "HS384", "HS512"]:
                 for secret in JWT_COMMON_SECRETS:
                     try:
                         jwt.decode(token, secret, algorithms=[header.get("alg")])
-                        logger.log(f"CRITICAL: JWT cracked with secret: {secret}", "FAIL")
+                        logger.error(f"CRITICAL: JWT cracked with secret: {secret}")
                         token_findings["issues"].append(f"weak_secret:{secret}")
                         break
                     except:
@@ -879,24 +817,23 @@ def jwt_analyze(domain, logger, session, limiter):
             sensitive_keys = ["password", "secret", "admin", "role", "privilege", "email", "username", "id"]
             for key in payload:
                 if any(sk in key.lower() for sk in sensitive_keys):
-                    logger.log(f"WARN: JWT contains sensitive key: {key}", "WARN")
+                    logger.warn(f"JWT contains sensitive key: {key}")
                     token_findings["issues"].append(f"sensitive_data:{key}")
 
             findings.append(token_findings)
 
         except Exception as e:
-            logger.log(f"JWT parse error: {e}", "WARN")
+            logger.debug(f"JWT parse error: {e}")
 
-    logger.log(f"JWT analysis complete. Tokens analyzed: {len(findings)}")
+    logger.ok(f"JWT analysis complete. Tokens analyzed: {len(findings)}")
     return findings
 
 
 def take_screenshots(domain, logger, crawled_urls):
-    logger.phase("PHASE 14: SCREENSHOT SYSTEM")
+    logger.phase("SCREENSHOT SYSTEM")
 
     if not PLAYWRIGHT_AVAILABLE:
-        logger.log("Playwright not installed. Skipping screenshots.", "WARN")
-        logger.log("Install: pip install playwright && playwright install chromium", "INFO")
+        logger.warn("Playwright not installed. Skipping screenshots.")
         return []
 
     screenshots = []
@@ -904,7 +841,6 @@ def take_screenshots(domain, logger, crawled_urls):
     os.makedirs(screenshot_dir, exist_ok=True)
 
     urls_to_shoot = [f"http://{domain}", f"https://{domain}"]
-
     interesting_paths = ["/admin", "/login", "/dashboard", "/api", "/upload", "/config"]
     for path in interesting_paths:
         urls_to_shoot.append(f"http://{domain}{path}")
@@ -916,10 +852,7 @@ def take_screenshots(domain, logger, crawled_urls):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1920, "height": 1080}
-            )
+            context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1920, "height": 1080})
 
             for url in urls_to_shoot:
                 try:
@@ -931,24 +864,24 @@ def take_screenshots(domain, logger, crawled_urls):
 
                     page.screenshot(path=filename, full_page=True)
                     screenshots.append({"url": url, "file": filename})
-                    logger.log(f"Screenshot: {url} -> {filename}", "OK")
+                    logger.ok(f"Screenshot: {url} -> {filename}")
 
                     page.close()
                 except Exception as e:
-                    logger.log(f"Screenshot failed for {url}: {e}", "WARN")
+                    logger.warn(f"Screenshot failed for {url}: {e}")
 
             browser.close()
 
     except Exception as e:
-        logger.log(f"Playwright error: {e}", "FAIL")
+        logger.error(f"Playwright error: {e}")
 
-    logger.log(f"Screenshots taken: {len(screenshots)}")
+    logger.ok(f"Screenshots taken: {len(screenshots)}")
     return screenshots
 
 
 def generate_html_report(data, domain, timestamp, logger=None):
     if logger:
-        logger.phase("PHASE 15: HTML REPORT GENERATION")
+        logger.phase("HTML REPORT GENERATION")
 
     html_path = f"latent_report_{domain}_{timestamp}.html"
 
@@ -1027,7 +960,7 @@ def generate_html_report(data, domain, timestamp, logger=None):
         .screenshot h4 {{ margin-bottom: 10px; color: #555; }}
         ul {{ list-style: none; padding-left: 0; }}
         ul li {{ padding: 8px 0; border-bottom: 1px solid #eee; }}
-        ul li:before {{ content: "&#9656;"; color: #667eea; margin-right: 10px; }}
+        ul li:before {{ content: ">"; color: #667eea; margin-right: 10px; }}
         .tech-tags {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
         .tag {{ background: #667eea; color: white; padding: 4px 12px; border-radius: 15px; font-size: 0.85em; }}
         footer {{ text-align: center; padding: 20px; color: #666; margin-top: 30px; }}
@@ -1036,7 +969,7 @@ def generate_html_report(data, domain, timestamp, logger=None):
 <body>
     <div class="container">
         <header>
-            <h1>&#127919; LATENT</h1>
+            <h1>LATENT</h1>
             <p>Multi-Phase Web & Network Pentest Report</p>
             <p style="margin-top: 10px; font-size: 0.9em;">Target: <strong>{domain}</strong> | Generated: {timestamp}</p>
         </header>
@@ -1069,64 +1002,64 @@ def generate_html_report(data, domain, timestamp, logger=None):
         </div>
 
         <div class="section">
-            <h2>&#128269; Technology Fingerprinting</h2>
+            <h2>Technology Fingerprinting</h2>
             <pre style="background: #f8f9fa; padding: 15px; border-radius: 4px; overflow-x: auto;">{json.dumps(data.get('technology', {{}}), indent=2)}</pre>
         </div>
 
         <div class="section">
-            <h2>&#127760; Crawled URLs ({len(data.get('crawled_urls', []))})</h2>
+            <h2>Crawled URLs ({len(data.get('crawled_urls', []))})</h2>
             <ul>{crawl_html if crawl_html else "<li>No URLs crawled</li>"}</ul>
         </div>
 
         <div class="section">
-            <h2>&#128225; JavaScript Endpoints ({len(data.get('js_endpoints', []))})</h2>
+            <h2>JavaScript Endpoints ({len(data.get('js_endpoints', []))})</h2>
             <ul>{js_html if js_html else "<li>No endpoints found</li>"}</ul>
         </div>
 
         <div class="section">
-            <h2>&#128275; CORS Misconfiguration Findings ({len(data.get('cors_findings', []))})</h2>
+            <h2>CORS Misconfiguration Findings ({len(data.get('cors_findings', []))})</h2>
             {cors_html if cors_html else "<p>No CORS issues detected.</p>"}
         </div>
 
         <div class="section">
-            <h2>&#128273; JWT Analysis ({len(data.get('jwt_findings', []))})</h2>
+            <h2>JWT Analysis ({len(data.get('jwt_findings', []))})</h2>
             {jwt_html if jwt_html else "<p>No JWT tokens found or analyzed.</p>"}
         </div>
 
         <div class="section">
-            <h2>&#128248; Screenshots ({len(data.get('screenshots', []))})</h2>
+            <h2>Screenshots ({len(data.get('screenshots', []))})</h2>
             {screenshots_html if screenshots_html else "<p>No screenshots taken.</p>"}
         </div>
 
         <div class="section">
-            <h2>&#128194; Open Ports</h2>
+            <h2>Open Ports</h2>
             <ul>
                 {''.join([f"<li>Port {p[0]}/{p[1]}</li>" for p in data.get('open_ports', [])])}
             </ul>
         </div>
 
         <div class="section">
-            <h2>&#128193; Interesting Directories ({len(data.get('directories', []))})</h2>
+            <h2>Interesting Directories ({len(data.get('directories', []))})</h2>
             <ul>
                 {''.join([f"<li>[{d[1]}] {d[0]} ({d[2]} bytes)</li>" for d in data.get('directories', [])])}
             </ul>
         </div>
 
         <div class="section">
-            <h2>&#128100; WHOIS Information</h2>
+            <h2>WHOIS Information</h2>
             <pre style="background: #f8f9fa; padding: 15px; border-radius: 4px; overflow-x: auto;">{json.dumps(data.get('whois', {{}}), indent=2) if data.get('whois') else "No WHOIS data available."}</pre>
         </div>
 
         <div class="section">
-            <h2>&#128272; Brute Force Candidates ({len(data.get('brute_candidates', []))})</h2>
+            <h2>Brute Force Candidates ({len(data.get('brute_candidates', []))})</h2>
             <ul>
                 {''.join([f"<li>{c[1]}:{c[2]} @ {c[0]}</li>" for c in data.get('brute_candidates', [])]) if data.get('brute_candidates') else "<li>No candidates found</li>"}
             </ul>
         </div>
 
         <footer>
-            <p>Generated by LATENT v0.3.0 | Multi-Phase Pentest Tool</p>
-            <p style="font-size: 0.8em; margin-top: 5px;">&#9888; For authorized testing only. Unauthorized use is illegal.</p>
+            <p>Generated by LATENT v{VERSION}</p>
+            <p style="font-size: 0.8em; margin-top: 5px;">For authorized testing only. Unauthorized use is illegal.</p>
         </footer>
     </div>
 </body>
@@ -1136,7 +1069,7 @@ def generate_html_report(data, domain, timestamp, logger=None):
         f.write(html_content)
 
     if logger:
-        logger.log(f"HTML report generated: {html_path}", "OK")
+        logger.ok(f"HTML report generated: {html_path}")
 
     return html_path
 
@@ -1147,42 +1080,35 @@ def build_report(data, path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LATENT - Multi-Phase Pentest Tool")
+    parser = argparse.ArgumentParser(description="LATENT - Multi-Phase Pentest Tool", epilog="Example: latent -t example.com -w subdomains.txt --html --screenshot")
     parser.add_argument("-t", "--target", required=True, help="Target domain or URL")
-    parser.add_argument("-w", "--wordlist", default="/home/whoami/codesx/subdomains.txt",
-                        help="Subdomain/wordlist path")
-    parser.add_argument("-p","--ports", type=int, default=1000, help="Max port to scan")
-    parser.add_argument("--threads", type=int, default=150, help="Port scan thread count")
-    parser.add_argument("--sub-limit", type=int, default=50, help="Subdomain limit (0=all)")
-    parser.add_argument("--rate", type=float, default=0.3, help="Inter-request delay in seconds")
+    parser.add_argument("-w", "--wordlist", default="subdomains.txt", help="Subdomain/wordlist path")
+    parser.add_argument("-p","--ports", type=int, default=1000, help="Max port to scan (default: 1000)")
+    parser.add_argument("--threads", type=int, default=150, help="Port scan thread count (default: 150)")
+    parser.add_argument("--sub-limit", type=int, default=50, help="Subdomain limit (0=all) (default: 50)")
+    parser.add_argument("--rate", type=float, default=0.3, help="Inter-request delay in seconds (default: 0.3)")
     parser.add_argument("--brute", action="store_true", help="Enable login brute-force")
     parser.add_argument("--sqlmap", action="store_true", help="Enable SQLMap integration")
-    parser.add_argument("--no-color", action="store_true", help="Disable terminal colors")
     parser.add_argument("--json", action="store_true", help="Emit JSON report alongside TXT")
     parser.add_argument("--html", action="store_true", help="Generate HTML report")
     parser.add_argument("--screenshot", action="store_true", help="Take screenshots with Playwright")
-    parser.add_argument("--crawl-depth", type=int, default=2, help="Max crawl depth")
-    parser.add_argument("--crawl-pages", type=int, default=50, help="Max pages to crawl")
+    parser.add_argument("--crawl-depth", type=int, default=2, help="Max crawl depth (default: 2)")
+    parser.add_argument("--crawl-pages", type=int, default=50, help="Max pages to crawl (default: 50)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
-
-    if args.no_color:
-        import colorama
-        colorama.deinit()
 
     domain = resolve_domain(args.target)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_txt = f"latent_report_{domain}_{ts}.txt"
     report_json = f"latent_report_{domain}_{ts}.json"
 
-    print(f"""
-{Fore.CYAN}===============================================================
-                     LATENT - PROBE TOOL
-                         discord : @itzlatent
-===============================================================
-{Style.RESET_ALL}""")
+    print(f"{'='*70}")
+    print(f"                     LATENT - PROBE TOOL v{VERSION}")
+    print(f"                         discord : @itzlatent")
+    print(f"{'='*70}")
 
     with open(report_txt, "w", encoding="utf-8") as rf:
-        logger = Logger(rf)
+        logger = Logger(rf, verbose=args.verbose)
         session = requests.Session()
         session.headers.update(HEADERS)
         limiter = RateLimiter(args.rate)
@@ -1191,39 +1117,100 @@ def main():
         logger.log(f"Wordlist: {args.wordlist}")
         logger.log(f"MaxPort: {args.ports} | Threads: {args.threads} | Rate: {args.rate}s")
 
-        html, html_path, tech = fetch_html(domain, logger, session)
-        open_ports = scan_ports(domain, args.ports, logger, args.threads)
-        smb_data = smb_probe(domain, logger)
+        try:
+            html, html_path, tech = fetch_html(domain, logger, session)
+        except Exception as e:
+            logger.error(f"HTML fetch failed: {e}")
+            html, html_path, tech = None, None, {}
 
-        if aiodns:
-            found_subs = asyncio.run(subdomain_async(domain, args.wordlist, logger, args.sub_limit))
-        else:
-            found_subs = subdomain_sync(domain, args.wordlist, logger, args.sub_limit)
+        try:
+            open_ports = scan_ports(domain, args.ports, logger, args.threads)
+        except Exception as e:
+            logger.error(f"Port scan failed: {e}")
+            open_ports = []
 
-        xss_hits = xss_probe(domain, logger, session, limiter)
-        dirs = dir_fuzz(domain, logger, session, limiter)
-        whois_data = whois_lookup(domain, logger)
+        try:
+            smb_data = smb_probe(domain, logger)
+        except Exception as e:
+            logger.error(f"SMB probe failed: {e}")
+            smb_data = None
+
+        try:
+            if aiodns:
+                found_subs = asyncio.run(subdomain_async(domain, args.wordlist, logger, args.sub_limit))
+            else:
+                found_subs = subdomain_sync(domain, args.wordlist, logger, args.sub_limit)
+        except Exception as e:
+            logger.error(f"Subdomain enum failed: {e}")
+            found_subs = []
+
+        try:
+            xss_hits = xss_probe(domain, logger, session, limiter)
+        except Exception as e:
+            logger.error(f"XSS probe failed: {e}")
+            xss_hits = 0
+
+        try:
+            dirs = dir_fuzz(domain, logger, session, limiter)
+        except Exception as e:
+            logger.error(f"Dir fuzz failed: {e}")
+            dirs = []
+
+        try:
+            whois_data = whois_lookup(domain, logger)
+        except Exception as e:
+            logger.error(f"WHOIS lookup failed: {e}")
+            whois_data = None
 
         sqlmap_result = False
         if args.sqlmap:
-            sqlmap_result = sqlmap_probe(domain, logger)
+            try:
+                sqlmap_result = sqlmap_probe(domain, logger)
+            except Exception as e:
+                logger.error(f"SQLMap failed: {e}")
 
         brute_results = []
         if args.brute:
-            brute_results = brute_login(domain, args.wordlist, logger, session, limiter)
+            try:
+                brute_results = brute_login(domain, args.wordlist, logger, session, limiter)
+            except Exception as e:
+                logger.error(f"Brute force failed: {e}")
 
-        crawled_urls = recursive_crawl(domain, logger, session, limiter, args.crawl_depth, args.crawl_pages)
-        js_endpoints = extract_js_endpoints(domain, logger, session, limiter, crawled_urls)
-        cors_findings = cors_check(domain, logger, session, limiter)
-        jwt_findings = jwt_analyze(domain, logger, session, limiter)
+        try:
+            crawled_urls = recursive_crawl(domain, logger, session, limiter, args.crawl_depth, args.crawl_pages)
+        except Exception as e:
+            logger.error(f"Crawler failed: {e}")
+            crawled_urls = []
+
+        try:
+            js_endpoints = extract_js_endpoints(domain, logger, session, limiter, crawled_urls)
+        except Exception as e:
+            logger.error(f"JS endpoint extraction failed: {e}")
+            js_endpoints = []
+
+        try:
+            cors_findings = cors_check(domain, logger, session, limiter)
+        except Exception as e:
+            logger.error(f"CORS check failed: {e}")
+            cors_findings = []
+
+        try:
+            jwt_findings = jwt_analyze(domain, logger, session, limiter)
+        except Exception as e:
+            logger.error(f"JWT analysis failed: {e}")
+            jwt_findings = []
 
         screenshots = []
         if args.screenshot:
-            screenshots = take_screenshots(domain, logger, crawled_urls)
+            try:
+                screenshots = take_screenshots(domain, logger, crawled_urls)
+            except Exception as e:
+                logger.error(f"Screenshot failed: {e}")
 
         summary = {
             "target": domain,
             "timestamp": ts,
+            "version": VERSION,
             "html_saved": html_path,
             "technology": tech,
             "open_ports": open_ports,
@@ -1238,39 +1225,53 @@ def main():
             "js_endpoints": js_endpoints,
             "cors_findings": cors_findings,
             "jwt_findings": jwt_findings,
-            "screenshots": screenshots
+            "screenshots": screenshots,
+            "errors": logger.errors,
+            "warnings": logger.warnings
         }
 
         if args.json:
-            build_report(summary, report_json)
-            logger.log(f"JSON report: {report_json}", "OK")
+            try:
+                build_report(summary, report_json)
+                logger.ok(f"JSON report: {report_json}")
+            except Exception as e:
+                logger.error(f"JSON report failed: {e}")
 
         if args.html:
-            html_report_path = generate_html_report(summary, domain, ts, logger=logger)
-            logger.log(f"HTML report: {html_report_path}", "OK")
+            try:
+                html_report_path = generate_html_report(summary, domain, ts, logger=logger)
+                logger.ok(f"HTML report: {html_report_path}")
+            except Exception as e:
+                logger.error(f"HTML report failed: {e}")
 
         logger.phase("SUMMARY")
-        logger.log(f"Open Ports: {len(open_ports)}")
-        logger.log(f"Subdomains: {len(found_subs)}")
-        logger.log(f"XSS Reflected: {xss_hits}")
-        logger.log(f"Interesting Paths: {len(dirs)}")
-        logger.log(f"Crawled URLs: {len(crawled_urls)}")
-        logger.log(f"JS Endpoints: {len(js_endpoints)}")
-        logger.log(f"CORS Issues: {len(cors_findings)}")
-        logger.log(f"JWT Findings: {len(jwt_findings)}")
-        logger.log(f"Screenshots: {len(screenshots)}")
-        logger.log(f"Brute Candidates: {len(brute_results)}")
-        logger.log(f"TXT Report: {report_txt}", "OK")
+        logger.ok(f"Open Ports: {len(open_ports)}")
+        logger.ok(f"Subdomains: {len(found_subs)}")
+        logger.ok(f"XSS Reflected: {xss_hits}")
+        logger.ok(f"Interesting Paths: {len(dirs)}")
+        logger.ok(f"Crawled URLs: {len(crawled_urls)}")
+        logger.ok(f"JS Endpoints: {len(js_endpoints)}")
+        logger.ok(f"CORS Issues: {len(cors_findings)}")
+        logger.ok(f"JWT Findings: {len(jwt_findings)}")
+        logger.ok(f"Screenshots: {len(screenshots)}")
+        logger.ok(f"Brute Candidates: {len(brute_results)}")
+        logger.ok(f"TXT Report: {report_txt}")
 
-    print(f"\n{Fore.GREEN}[*] Done. Report: {report_txt}{Style.RESET_ALL}")
+        if logger.errors:
+            logger.warn(f"Total errors: {len(logger.errors)}")
+        if logger.warnings:
+            logger.warn(f"Total warnings: {len(logger.warnings)}")
+
+    print(f"\n[*] Done. Report: {report_txt}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}[!] Interrupted by user.{Style.RESET_ALL}")
+        print("\n[!] Interrupted by user.")
         sys.exit(0)
     except Exception as e:
-        print(f"\n{Fore.RED}[!] Fatal: {e}{Style.RESET_ALL}")
+        print(f"\n[!] Fatal: {e}")
+        traceback.print_exc()
         sys.exit(1)
