@@ -1103,8 +1103,8 @@ def main():
     report_json = f"latent_report_{domain}_{ts}.json"
 
     print(f"{'='*70}")
-    print(f"                     LATENT - PROBE TOOL v{VERSION}")
-    print(f"                         discord : @itzlatent")
+    print(f"                     LATENT | PROBE v{VERSION}")
+    print(f"                         discord : @saintlatent")
     print(f"{'='*70}")
 
     with open(report_txt, "w", encoding="utf-8") as rf:
