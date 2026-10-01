@@ -1,48 +1,31 @@
-#!/usr/bin/env python3
-import requests
+import re
 import sys
-import os
+from pathlib import Path
 from urllib.parse import urlparse
 
-# repo: snaphtml
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+from Latent.http_client import manager_for_target
 
-def fetch(target):
-    if not target.startswith("http"):
-        target = "http://" + target
 
-    variants = [target, target.replace("http://", "https://")]
+def fetch(target, manager=None):
+    parsed = urlparse(target if "://" in target else f"https://{target}")
+    if not parsed.hostname:
+        raise ValueError("A valid target hostname is required.")
+    manager = manager or manager_for_target(parsed.hostname)
+    url = target if "://" in target else f"https://{target}"
+    response = manager.request(url)
+    if response is None:
+        return None
+    filename = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', parsed.netloc)}.html"
+    with open(filename, "w", encoding="utf-8") as output:
+        output.write(response.text)
+    print(f"[+] {response.status_code} - {len(response.content)} bytes; saved {filename}")
+    return response.text
 
-    for url in variants:
-        try:
-            print(f"[*] Deneniyor: {url}")
-            r = requests.get(url, timeout=10, headers={"User-Agent": USER_AGENT}, verify=False)
-            print(f"[+] {r.status_code} - {len(r.text)} bytes")
-
-            parsed = urlparse(url)
-            filename = f"{parsed.netloc}.html"
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(r.text)
-            print(f"[+] Kaydedildi: {filename}")
-
-            # Basit tech fingerprint
-            headers = dict(r.headers)
-            print(f"[*] Server: {headers.get('Server', 'N/A')}")
-            print(f"[*] Powered-By: {headers.get('X-Powered-By', 'N/A')}")
-            return r.text
-        except Exception as e:
-            print(f"[-] Hata: {e}")
-
-    print("[-] Cekilemedi.")
-    return None
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Kullanim: python3 snaphtml.py <hedef>")
-        print("Ornek: python3 snaphtml.py hedef.com")
-        sys.exit(1)
-
-    import urllib3
-    urllib3.disable_warnings()
+        print("Usage: python -m Latent.core.snaphtml <authorized-target>")
+        raise SystemExit(1)
     fetch(sys.argv[1])
