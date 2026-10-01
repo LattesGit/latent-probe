@@ -1,170 +1,181 @@
 #!/usr/bin/env python3
-import os
-import sys
-import subprocess
-import socket
-import ssl
+
+import argparse
+import html
 import ipaddress
 import json
-import time
-import argparse
-import asyncio
 import re
-import base64
-import hashlib
-from datetime import datetime
-from urllib.parse import urlparse, urljoin, parse_qs
+import secrets
+import socket
+import ssl
+import sys
+import threading
+import time
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import deque
-import logging
-import traceback
+from datetime import datetime
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import requests
-import urllib3
 
 try:
-    from tqdm import tqdm
+    from . import http_client as _http_client
 except ImportError:
-    tqdm = None
+    import http_client as _http_client
 
-try:
-    import whois
-except ImportError:
-    whois = None
-
-try:
-    import aiodns
-except ImportError:
-    aiodns = None
-
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    sync_playwright = None
+sys.modules.setdefault("Latent.http_client", _http_client)
+configure_http_manager = _http_client.configure
 
 try:
     from bs4 import BeautifulSoup
-    BS4_AVAILABLE = True
 except ImportError:
-    BS4_AVAILABLE = False
     BeautifulSoup = None
 
 try:
-    import jwt
-    JWT_AVAILABLE = True
+    from rich.console import Console
+    from rich.panel import Panel
+    RICH = True
+    CONSOLE = Console()
 except ImportError:
-    JWT_AVAILABLE = False
-    jwt = None
+    RICH = False
+    Console = Panel = CONSOLE = None
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+try:
+    import dns.flags
+    import dns.rdatatype
+    import dns.resolver
+    DNSPYTHON_AVAILABLE = True
+except ImportError:
+    dns = None
+    DNSPYTHON_AVAILABLE = False
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
-HEADERS = {"User-Agent": USER_AGENT}
-TIMEOUT = 10
-VERSION = ""
 
-COMMON_DIRS = [
-    "/admin", "/admin/login", "/admin.php", "/administrator",
-    "/login", "/signin", "/auth", "/auth/login",
-    "/dashboard", "/panel", "/controlpanel", "/cp",
-    "/api", "/api/v1", "/api/v2", "/api/admin", "/graphql",
-    "/rest", "/swagger", "/swagger-ui", "/docs", "/openapi.json",
-    "/config", "/config.php", "/settings", "/settings.php",
-    "/.env", "/.env.backup", "/.env.local",
-    "/debug", "/debug.log", "/error.log",
-    "/.git", "/.git/config", "/.git/HEAD",
-    "/backup", "/backups", "/backup.zip", "/site.zip",
-    "/dump.sql", "/database.sql", "/db.sql",
-    "/wp-admin", "/wp-login.php", "/wp-content",
-    "/joomla", "/user/login",
-    "/phpmyadmin", "/pma", "/mysql",
-    "/server-status", "/status",
-    "/dev", "/development", "/staging", "/test",
-    "/upload", "/uploads", "/files",
-    "/tmp", "/temp",
-    "/robots.txt", "/sitemap.xml",
-    "/crossdomain.xml", "/security.txt",
-    "/jenkins", "/gitlab", "/ci",
-    "/kibana", "/grafana", "/prometheus",
-    "/hidden", "/secret", "/private",
-    "/internal", "/intranet"
-]
-
-XSS_PAYLOADS = [
-    r"<script>alert(1)</script>",
-    r"<script>alert(document.domain)</script>",
-    r"<img src=x onerror=alert(1)>",
-    r"<svg onload=alert(1)>",
-    r"javascript:alert(1)",
-    r'" onmouseover=alert(1) x="',
-    r"' onmouseover=alert(1) x='",
-    r"%3Cscript%3Ealert(1)%3C/script%3E",
-    r"%3Cimg%20src=x%20onerror=alert(1)%3E",
-    r'"><script>alert(1)</script>',
-    r"'><script>alert(1)</script>",
-]
-
-LOGIN_PATHS = ["/login", "/admin", "/wp-login.php", "/administrator", "/user/login", "/signin", "/auth"]
-
-COMMON_USERS = ["admin", "root", "user", "test", "administrator", "guest"]
-
-CORS_TEST_ORIGINS = [
-    "https://evil.com", "http://evil.com", "null",
-    "https://attacker.com", "http://localhost", "https://localhost",
-    "http://127.0.0.1", "https://127.0.0.1"
-]
-
-JWT_COMMON_SECRETS = [
-    "secret", "secret123", "password", "123456", "admin",
-    "jwt", "token", "key", "supersecret", "changeme"
-]
-
-SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+USER_AGENT = "LATENT-Security-Assessment/1.0 (authorized low-impact testing)"
+TIMEOUT = 8
+MAX_BODY = 1_000_000
+SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 SEVERITY_WEIGHT = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 12, "LOW": 5, "INFO": 1}
 CONFIDENCE_WEIGHT = {"HIGH": 1.0, "MEDIUM": 0.7, "LOW": 0.4}
-
-SECRET_PATTERNS = [
-    r'(?:api[_-]?key|apikey|token|secret|password|passwd)\s*[:=]\s*["\']([^"\']{8,})["\']',
-    r'(?:aws_access_key_id|aws_secret_access_key)\s*[:=]\s*["\']([^"\']+)["\']',
-    r'(?:private[_-]?key|secret[_-]?key)\s*[:=]\s*["\']([^"\']+)["\']',
-]
-
-ERROR_SIGNATURES = [
-    r"Traceback \(most recent call last\)",
-    r"Warning:\s+mysql_",
-    r"Fatal error:",
-    r"Uncaught Exception",
-    r"System\.Exception",
-    r"at System\.",
-    r"ORA-\d{5}",
-    r"Microsoft OLE DB Provider",
-    r"Django Version:",
-    r"Whoops!\s+There was an error",
-    r"NoMethodError",
-    r"PHP Parse error",
-    r"java\.lang\.[A-Za-z]+Exception",
-]
-
-WAF_SIGNATURES = {
-    "cf-ray": "Cloudflare",
-    "x-sucuri-id": "Sucuri",
-    "x-sucuri-cache": "Sucuri",
-    "x-akamai": "Akamai",
-    "x-cdn": "Generic CDN",
-    "server: cloudflare": "Cloudflare",
-    "x-iinfo": "Incapsula",
-    "x-cdn-provider": "Generic CDN",
+ERROR_PATTERNS = (
+    r"Traceback \(most recent call last\)", r"Fatal error:", r"Uncaught Exception",
+    r"java\.lang\.[A-Za-z]+Exception", r"Django Version:", r"ORA-\d{5}",
+    r"PHP Parse error", r"Whoops!\s+There was an error",
+)
+COMMON_SENSITIVE_PATHS = {
+    "/.env": ("Environment file", re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", re.M)),
+    "/.env.local": ("Environment file", re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", re.M)),
+    "/.git/HEAD": ("Git repository metadata", re.compile(r"^ref:\s+refs/", re.M)),
+    "/.git/config": ("Git configuration", re.compile(r"^\[(?:core|remote|branch)\]", re.M)),
+    "/backup.zip": ("Backup archive", None),
+    "/backup.tar.gz": ("Backup archive", None),
+    "/dump.sql": ("Database dump", re.compile(r"\b(?:CREATE TABLE|INSERT INTO)\b", re.I)),
+    "/database.sql": ("Database dump", re.compile(r"\b(?:CREATE TABLE|INSERT INTO)\b", re.I)),
+    "/config.json": ("Configuration file", re.compile(r"^\s*[\[{]")),
+    "/debug.log": ("Debug log", re.compile(r"error|exception|traceback", re.I)),
+    "/.well-known/security.txt": ("security.txt", None),
+    "/robots.txt": ("robots.txt", None),
+    "/sitemap.xml": ("sitemap.xml", None),
+    "/server-status": ("Server status endpoint", None),
+    "/actuator/env": ("Actuator environment endpoint", re.compile(r"propertysources", re.I)),
 }
+API_PATHS = (
+    "/swagger.json", "/swagger/v1/swagger.json", "/openapi.json",
+    "/openapi.yaml", "/api-docs", "/v2/api-docs", "/v3/api-docs",
+    "/swagger-ui/", "/graphql", "/api/graphql",
+)
+LOGIN_PATTERN = re.compile(r"/(?:login|signin|sign-in|auth)(?:/|$)", re.I)
+ACTION_PATH_PATTERN = re.compile(
+    r"/(?:logout|signout|delete|remove|unsubscribe|disable|cancel)(?:/|$)", re.I
+)
 
-CDN_SERVER_TOKENS = {
-    "cloudflare": "Cloudflare",
-    "akamaighost": "Akamai",
-    "fastly": "Fastly",
-    "cloudfront": "CloudFront",
-    "varnish": "Varnish",
-}
+
+def normalize_target(value):
+    value = value.strip()
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    parsed = urlparse(value if "://" in value else "//" + value)
+    if parsed.username or parsed.password:
+        raise ValueError("Target URLs cannot include embedded credentials.")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("Provide a valid hostname or IP address.")
+    try:
+        host = host.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("Target hostname is invalid.") from exc
+    if len(host) > 253 or not re.fullmatch(
+        r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)"
+        r"(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*",
+        host,
+    ):
+        raise ValueError("Provide a valid hostname or IP address.")
+    return host
+
+
+def format_host(host):
+    try:
+        return f"[{host}]" if ipaddress.ip_address(host).version == 6 else host
+    except ValueError:
+        return host
+
+
+def resolve_ips(host):
+    try:
+        return sorted({item[4][0] for item in socket.getaddrinfo(host, None)})
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+
+
+def is_public_target(host):
+    ips = resolve_ips(host)
+    return bool(ips) and all(
+        (lambda addr: addr.is_global)(ipaddress.ip_address(value)) for value in ips
+    )
+
+
+def ssrf_guard(host, logger=None):
+    ips = resolve_ips(host)
+    if not ips or any(not ipaddress.ip_address(value).is_global for value in ips):
+        if logger:
+            logger.warn(f"SSRF protection refused unresolved or non-public host: {host}")
+        return False
+    return True
+
+
+def resolve_domain(target):
+    return normalize_target(target)
+
+
+def make_finding(fid, title, severity, confidence, category, target, evidence,
+                 description, remediation):
+    return {
+        "id": fid,
+        "title": title,
+        "category": category,
+        "severity": severity,
+        "confidence": confidence,
+        "target": target,
+        "evidence": evidence,
+        "description": description,
+        "impact": description,
+        "remediation": remediation,
+    }
+
+
+def risk_score(findings):
+    score = sum(
+        SEVERITY_WEIGHT.get(item.get("severity", "INFO"), 1)
+        * CONFIDENCE_WEIGHT.get(item.get("confidence", "MEDIUM"), 0.7)
+        for item in findings
+    )
+    value = min(100, round(score))
+    label = (
+        "LOW" if value <= 20 else "MODERATE" if value <= 40 else
+        "MEDIUM" if value <= 60 else "HIGH" if value <= 80 else "CRITICAL"
+    )
+    return value, label
 
 
 class Logger:
@@ -173,1823 +184,1235 @@ class Logger:
         self.verbose = verbose
         self.errors = []
         self.warnings = []
+        self.manager = None
 
-    def log(self, msg, level="INFO"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        prefixes = {"INFO": "[*]", "OK": "[+]", "WARN": "[!]", "ERROR": "[X]", "DEBUG": "[D]"}
-        prefix = prefixes.get(level, "[*]")
-        line = f"{ts} {prefix} {msg}"
-        print(line)
+    def phase(self, name):
+        if RICH:
+            CONSOLE.print(Panel(name, expand=False, border_style="cyan"))
+            if self.manager:
+                CONSOLE.print(
+                    f"Requests {self.manager.count}/{self.manager.budget} | "
+                    f"{self.manager.elapsed:.1f}s | "
+                    f"safe stop: {self.manager.stop_reason or 'not triggered'}",
+                    style="dim",
+                )
+        else:
+            print(f"\n{'=' * 64}\n  {name}\n{'=' * 64}")
+            if self.manager:
+                print(
+                    f"Requests {self.manager.count}/{self.manager.budget} | "
+                    f"{self.manager.elapsed:.1f}s | "
+                    f"safe stop: {self.manager.stop_reason or 'not triggered'}"
+                )
+        if self.report_file:
+            self.report_file.write(f"\n{'=' * 64}\n  {name}\n{'=' * 64}\n")
+
+    def log(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefixes = {"INFO": "[*]", "OK": "[+]", "WARN": "[!]", "ERROR": "[X]"}
+        line = f"{timestamp} {prefixes.get(level, '[*]')} {message}"
+        if RICH:
+            styles = {"OK": "green", "WARN": "yellow", "ERROR": "bold red", "INFO": "cyan"}
+            CONSOLE.print(line, style=styles.get(level, "cyan"), markup=False)
+        else:
+            print(line)
         if self.report_file:
             self.report_file.write(line + "\n")
-        if level == "ERROR":
-            self.errors.append(msg)
-        elif level == "WARN":
-            self.warnings.append(msg)
+        if level == "WARN":
+            self.warnings.append(message)
+        elif level == "ERROR":
+            self.errors.append(message)
 
-    def phase(self, text):
-        print(f"\n{'='*70}")
-        print(f"  {text}")
-        print(f"{'='*70}")
-        if self.report_file:
-            self.report_file.write(f"\n{'='*70}\n  {text}\n{'='*70}\n")
+    def info(self, message):
+        self.log(message)
 
-    def error(self, msg, exc=None):
-        self.log(msg, "ERROR")
-        if exc and self.verbose:
-            traceback.print_exc()
+    def ok(self, message):
+        self.log(message, "OK")
 
-    def warn(self, msg):
-        self.log(msg, "WARN")
+    def warn(self, message):
+        self.log(message, "WARN")
 
-    def ok(self, msg):
-        self.log(msg, "OK")
+    def error(self, message):
+        self.log(message, "ERROR")
 
-    def debug(self, msg):
+    def debug(self, message):
         if self.verbose:
-            self.log(msg, "DEBUG")
+            self.log(message)
 
 
 class RateLimiter:
-    def __init__(self, delay=0.5):
-        self.delay = delay
-        self.last = 0
+    def __init__(self, delay=0.3):
+        self.delay = max(0.2, float(delay))
+        self.last = 0.0
+        self.lock = threading.Lock()
 
     def sleep(self):
-        elapsed = time.time() - self.last
-        if elapsed < self.delay:
-            time.sleep(self.delay - elapsed)
-        self.last = time.time()
+        with self.lock:
+            remaining = self.delay - (time.monotonic() - self.last)
+            if remaining > 0:
+                time.sleep(remaining)
+            self.last = time.monotonic()
+
+
+class RequestManager:
+    """One bounded HTTP transport for all scanner requests and redirects."""
+
+    def __init__(self, session=None, logger=None, limiter=None, budget=300,
+                 timeout=TIMEOUT, max_response_bytes=MAX_BODY, allowed_hosts=None):
+        self.session = session or requests.Session()
+        self.logger = logger or Logger()
+        self.limiter = limiter or RateLimiter()
+        self.budget = max(1, int(budget))
+        self.timeout = max(1, int(timeout))
+        self.max_response_bytes = max(1024, int(max_response_bytes))
+        self.allowed_hosts = {host.lower().rstrip(".") for host in (allowed_hosts or [])}
+        self.count = 0
+        self.start_time = time.monotonic()
+        self.stop_reason = None
+        self.status_codes = Counter()
+        self._lock = threading.Lock()
+        self._consecutive_errors = 0
+        self._slow_responses = 0
+        self._server_errors = 0
+
+    @property
+    def elapsed(self):
+        return time.monotonic() - self.start_time
+
+    @property
+    def request_count(self):
+        return self.count
+
+    def stop(self, reason):
+        if self.stop_reason is None:
+            self.stop_reason = reason
+            self.logger.warn(f"Automatic safe stop: {reason}")
+
+    def reserve(self):
+        if self.stop_reason:
+            return False
+        with self._lock:
+            if self.count >= self.budget:
+                self.stop(f"request budget exhausted ({self.budget})")
+                return False
+            self.count += 1
+            return True
+
+    def _validate_destination(self, url):
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            self.logger.warn(f"Refusing malformed or unsupported URL: {url}")
+            return False
+        host = parsed.hostname.lower().rstrip(".")
+        if self.allowed_hosts and host not in self.allowed_hosts:
+            self.logger.warn(f"Refusing out-of-scope HTTP destination: {host}")
+            return False
+        if not ssrf_guard(host, self.logger):
+            self.stop(f"SSRF protection blocked {host}")
+            return False
+        return True
+
+    def request(self, url, method="GET", **kwargs):
+        if self.stop_reason or not self._validate_destination(url) or not self.reserve():
+            return None
+        self.limiter.sleep()
+        headers = {"User-Agent": USER_AGENT}
+        headers.update(kwargs.pop("headers", {}) or {})
+        timeout = kwargs.pop("timeout", self.timeout)
+        kwargs.pop("allow_redirects", None)
+        verify = kwargs.pop("verify", True)
+        current_method = method.upper()
+        current_url = url
+        current_kwargs = dict(kwargs)
+
+        for hop in range(6):
+            started = time.monotonic()
+            response = None
+            try:
+                response = self.session.request(
+                    current_method, current_url, headers=headers, timeout=timeout,
+                    verify=verify, allow_redirects=False, stream=True, **current_kwargs
+                )
+                body = bytearray()
+                truncated = False
+                try:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        remaining = self.max_response_bytes - len(body)
+                        if len(chunk) > remaining:
+                            body.extend(chunk[:remaining])
+                            truncated = True
+                            break
+                        body.extend(chunk)
+                finally:
+                    response.close()
+                response._content = bytes(body)
+                response._content_consumed = True
+                if truncated:
+                    response.headers["X-LATENT-Response-Truncated"] = "true"
+                self.status_codes[response.status_code] += 1
+                self._consecutive_errors = 0
+                duration = time.monotonic() - started
+                self._slow_responses = self._slow_responses + 1 if duration >= 8 else 0
+                self._server_errors = self._server_errors + 1 if response.status_code >= 500 else 0
+
+                if response.status_code == 429:
+                    self.stop(f"HTTP 429; Retry-After={response.headers.get('Retry-After', 'not supplied')}")
+                elif response.status_code == 503 and response.headers.get("Retry-After"):
+                    self.stop(f"HTTP 503 throttling; Retry-After={response.headers['Retry-After']}")
+                elif response.status_code in (403, 503) and re.search(
+                    r"captcha|challenge|access denied|request blocked|web application firewall",
+                    response.text[:5000], re.I,
+                ):
+                    self.stop(f"WAF challenge/block observed (HTTP {response.status_code})")
+                elif self._slow_responses >= 2:
+                    self.stop("two consecutive slow responses (>=8 seconds)")
+                elif self._server_errors >= 3:
+                    self.stop("three consecutive server errors")
+
+                if response.status_code not in (301, 302, 303, 307, 308):
+                    return response
+                location = response.headers.get("Location")
+                if not location:
+                    return response
+                next_url = urljoin(current_url, location)
+                if not self._validate_destination(next_url):
+                    return response
+                if hop >= 5:
+                    self.stop("redirect hop limit reached")
+                    return response
+                if not self.reserve():
+                    return response
+                self.limiter.sleep()
+                current_url = next_url
+                if response.status_code == 303 or (
+                    response.status_code in (301, 302) and current_method == "POST"
+                ):
+                    current_method = "GET"
+                    current_kwargs.pop("data", None)
+                    current_kwargs.pop("json", None)
+            except requests.exceptions.Timeout:
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= 3:
+                    self.stop("three consecutive request timeouts")
+                return None
+            except requests.exceptions.RequestException as exc:
+                self.logger.debug(f"Request failed: {exc}")
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= 3:
+                    self.stop("three consecutive request errors")
+                return None
+        return response
+
+
+REQUEST_MANAGER = None
+DISCOVERED_PARAMETERS = {}
 
 
 def safe_request(session, url, method="GET", **kwargs):
-    try:
-        kwargs.setdefault("timeout", TIMEOUT)
-        kwargs.setdefault("headers", HEADERS)
-        if method.upper() == "GET":
-            return session.get(url, **kwargs)
-        elif method.upper() == "POST":
-            return session.post(url, **kwargs)
-        elif method.upper() == "HEAD":
-            return session.head(url, **kwargs)
-        else:
-            return session.request(method, url, **kwargs)
-    except requests.exceptions.Timeout:
-        return None
-    except requests.exceptions.ConnectionError:
-        return None
-    except Exception:
-        return None
+    if REQUEST_MANAGER is None:
+        raise RuntimeError("RequestManager must be initialized before sending HTTP requests.")
+    return REQUEST_MANAGER.request(url, method, **kwargs)
 
 
-def resolve_domain(target):
-    if "://" not in target:
-        target = "http://" + target
-    parsed = urlparse(target)
-    host = parsed.netloc if parsed.netloc else parsed.path
-    if "@" in host:
-        host = host.split("@")[-1]
-    if ":" in host:
-        host = host.split(":")[0]
-    return host.strip().lower()
-
-
-def mask_secret(value):
-    return "*" * min(len(value), 8)
-
-
-def resolve_all_ips(host):
-    ips = set()
-    try:
-        infos = socket.getaddrinfo(host, None)
-        for info in infos:
-            ips.add(info[4][0])
-    except Exception:
-        pass
-    return list(ips)
-
-
-def is_unsafe_ip(ip):
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return True
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
-
-
-def ssrf_guard(host, logger):
-    ips = resolve_all_ips(host)
-    if not ips:
-        logger.warn(f"Could not resolve {host}, skipping SSRF pre-check")
-        return True
-    for ip in ips:
-        if is_unsafe_ip(ip):
-            logger.error(f"Refusing to scan {host} -> {ip} (private/internal address)")
-            return False
-    return True
-
-
-def make_finding(fid, title, severity, confidence, category, target, evidence, description, remediation, references=None):
-    return {
-        "id": fid,
-        "title": title,
-        "severity": severity,
-        "confidence": confidence,
-        "category": category,
-        "target": target,
-        "evidence": evidence,
-        "description": description,
-        "remediation": remediation,
-        "references": references or [],
-    }
-
-
-def compute_risk_score(findings):
-    total = 0.0
-    for f in findings:
-        sw = SEVERITY_WEIGHT.get(f.get("severity", "INFO"), 1)
-        cw = CONFIDENCE_WEIGHT.get(f.get("confidence", "MEDIUM"), 0.7)
-        total += sw * cw
-    score = min(100, round(total))
-    if score <= 20:
-        label = "LOW"
-    elif score <= 40:
-        label = "MODERATE"
-    elif score <= 60:
-        label = "MEDIUM"
-    elif score <= 80:
-        label = "HIGH"
-    else:
-        label = "CRITICAL"
-    return score, label
-
-
-def fetch_html(domain, logger, session):
-    logger.phase("HTML FETCH & FINGERPRINT")
-    variants = [f"http://{domain}", f"https://{domain}", f"http://www.{domain}", f"https://www.{domain}"]
-
-    for url in variants:
-        try:
-            logger.log(f"Trying {url}")
-            r = safe_request(session, url)
-            if r is None:
-                continue
-            logger.ok(f"HTTP {r.status_code} - {len(r.text)} bytes")
-
-            path = f"{domain}_index.html"
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(r.text)
-            logger.ok(f"Saved: {path}")
-
-            tech = fingerprint_tech(r)
-            logger.log(f"Technology: {json.dumps(tech, indent=2)}")
-            return r.text, path, tech
-        except Exception as e:
-            logger.error(f"Failed: {url} -> {e}")
-
-    logger.error("HTML fetch failed.")
-    return None, None, {}
-
-
-def fingerprint_tech(response):
-    tech = {}
-    h = response.headers
-    if "Server" in h:
-        tech["server"] = h["Server"]
-    if "X-Powered-By" in h:
-        tech["powered_by"] = h["X-Powered-By"]
-
-    missing = []
-    for hdr in ["X-Frame-Options", "Content-Security-Policy", "X-Content-Type-Options", "Strict-Transport-Security"]:
-        if hdr not in h:
-            missing.append(hdr)
-    if missing:
-        tech["missing_headers"] = missing
-
-    txt = response.text.lower()
-    cms_patterns = {
-        "wordpress": "WordPress",
-        "drupal": "Drupal",
-        "joomla": "Joomla",
-        "django": "Django",
-        "laravel": "Laravel",
-        "rails": "Ruby on Rails",
-        "spring": "Spring",
-        "express": "Express.js",
-        "_next": "Next.js"
-    }
-    for pattern, name in cms_patterns.items():
-        if pattern in txt:
-            tech["cms"] = name
-            break
-
-    js_libs = []
-    if "jquery" in txt:
-        js_libs.append("jQuery")
-    if "bootstrap" in txt:
-        js_libs.append("Bootstrap")
-    if "axios" in txt:
-        js_libs.append("Axios")
-    if js_libs:
-        tech["js_libraries"] = js_libs
-
-    api_patterns = re.findall(r'["\']((?:/api|/graphql|/rest|/v\d+)[^"\'\s]*)["\']', response.text, re.IGNORECASE)
-    if api_patterns:
-        tech["api_endpoints"] = list(set(api_patterns[:20]))
-
-    if "authorization" in txt or "jwt" in txt or "bearer" in txt:
-        tech["auth_detected"] = True
-
-    cors_headers = {}
-    for hdr in ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Allow-Credentials"]:
-        if hdr in h:
-            cors_headers[hdr] = h[hdr]
-    if cors_headers:
-        tech["cors_headers"] = cors_headers
-
-    waf = set()
-    for hdr, val in h.items():
-        combo = f"{hdr.lower()}: {val.lower()}"
-        for sig, name in WAF_SIGNATURES.items():
-            if sig in hdr.lower() or sig in combo:
-                waf.add(name)
-    server_val = h.get("Server", "").lower()
-    for token, name in CDN_SERVER_TOKENS.items():
-        if token in server_val:
-            waf.add(name)
-    if waf:
-        tech["cdn_waf"] = sorted(waf)
-
-    return tech
-
-
-def scan_port_single(args):
-    domain, port = args
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            if s.connect_ex((domain, port)) == 0:
-                try:
-                    svc = socket.getservbyport(port, "tcp")
-                except (OSError, ValueError):
-                    svc = "unknown"
-                return (port, svc)
-    except Exception:
-        return None
-    return None
-
-
-def scan_ports(domain, max_port, logger, threads=150):
-    logger.phase("PORT SCAN")
-    open_ports = []
-    ports = list(range(1, max_port + 1))
-
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = {ex.submit(scan_port_single, (domain, p)): p for p in ports}
-        iterator = as_completed(futures)
-        if tqdm:
-            iterator = tqdm(iterator, total=len(ports), desc="Scanning ports", ncols=70)
-
-        for f in iterator:
-            res = f.result()
-            if res:
-                port, svc = res
-                logger.ok(f"OPEN {port}/{svc}")
-                open_ports.append(res)
-
-    logger.ok(f"Found {len(open_ports)} open ports")
-    return sorted(open_ports)
-
-
-def smb_probe(domain, logger):
-    logger.phase("SMB PROBE")
-    smb_ports = [139, 445]
-    found = []
-    for port in smb_ports:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2)
-                if s.connect_ex((domain, port)) == 0:
-                    logger.ok(f"SMB port {port} OPEN")
-                    found.append(port)
-        except Exception as e:
-            logger.debug(f"SMB port {port} error: {e}")
-
-    if found:
-        logger.warn("SMB detected")
-        try:
-            out = subprocess.run(["smbclient", "-L", f"//{domain}/", "-N"], capture_output=True, text=True, timeout=10)
-            if out.stdout:
-                logger.ok("SMB shares retrieved")
-                return out.stdout
-        except Exception as e:
-            logger.error(f"smbclient failed: {e}")
-    else:
-        logger.log("SMB ports closed")
-    return None
-
-
-def subdomain_sync(domain, wordlist, logger, limit):
-    logger.phase("SUBDOMAIN ENUM")
-    found = []
-
-    try:
-        with open(wordlist, "r", encoding="latin-1", errors="ignore") as f:
-            subs = []
-            for line in f:
-                sub = line.strip()
-                if sub and not sub.startswith("#"):
-                    subs.append(sub)
-    except Exception as e:
-        logger.error(f"Wordlist error: {e}")
-        return found
-
-    if limit > 0:
-        subs = subs[:limit]
-
-    logger.log(f"Testing {len(subs)} subdomains...")
-
-    for sub in (tqdm(subs, desc="Subdomains", ncols=70) if tqdm else subs):
-        full = f"{sub}.{domain}"
-        try:
-            ip = socket.gethostbyname(full)
-            logger.ok(f"FOUND {full} -> {ip}")
-            found.append((full, ip))
-        except (socket.gaierror, UnicodeEncodeError):
-            pass
-
-    logger.ok(f"Total subdomains: {len(found)}")
-    return found
-
-
-async def subdomain_async(domain, wordlist, logger, limit):
-    logger.phase("SUBDOMAIN ENUM (async)")
-    found = []
-    resolver = aiodns.DNSResolver()
-
-    try:
-        with open(wordlist, "r", encoding="latin-1", errors="ignore") as f:
-            subs = []
-            for line in f:
-                sub = line.strip()
-                if sub and not sub.startswith("#"):
-                    subs.append(sub)
-    except Exception as e:
-        logger.error(f"Wordlist error: {e}")
-        return found
-
-    if limit > 0:
-        subs = subs[:limit]
-
-    logger.log(f"Testing {len(subs)} subdomains...")
-
-    async def query(sub):
-        full = f"{sub}.{domain}"
-        try:
-            result = await resolver.query(full, "A")
-            return full, result[0].host
-        except Exception:
-            return None
-
-    tasks = [query(s) for s in subs]
-    for coro in (tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Subdomains") if tqdm else asyncio.as_completed(tasks)):
-        res = await coro
-        if res:
-            logger.ok(f"FOUND {res[0]} -> {res[1]}")
-            found.append(res)
-
-    logger.ok(f"Total subdomains: {len(found)}")
-    return found
-
-
-def xss_probe(domain, logger, session, limiter):
-    logger.phase("XSS PROBE")
-    pages = [f"http://{domain}", f"https://{domain}", f"http://{domain}/search", f"http://{domain}/contact"]
-    hits = 0
-    total_tests = 0
-
-    for page in pages:
-        try:
-            limiter.sleep()
-            r = safe_request(session, page)
-            if r is None or "<form" not in r.text.lower():
-                continue
-
-            for payload in XSS_PAYLOADS:
-                try:
-                    limiter.sleep()
-                    total_tests += 1
-                    test = f"{page}?q={payload}&search={payload}&id={payload}"
-                    r2 = safe_request(session, test)
-                    if r2 and payload in r2.text:
-                        logger.warn(f"XSS REFLECTED: {test}")
-                        hits += 1
-                except Exception as e:
-                    logger.debug(f"XSS test error: {e}")
-        except Exception as e:
-            logger.debug(f"XSS page error: {e}")
-
-    logger.ok(f"XSS tests done. Total: {total_tests}, Reflected: {hits}")
-    return hits
-
-
-def sqlmap_probe(domain, logger):
-    logger.phase("SQLMAP INTEGRATION")
-    targets = [f"http://{domain}", f"https://{domain}"]
-    vulnerable = False
-
-    for url in targets:
-        logger.log(f"SQLMap -> {url}")
-        cmd = ["sqlmap", "-u", url, "--batch", "--random-agent", "--level", "2", "--risk", "2", "--threads", "4", "--time-sec", "5", "--output-dir", f"./sqlmap_{domain}"]
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if out.stdout:
-                with open(f"{domain}_sqlmap.txt", "w") as f:
-                    f.write(out.stdout)
-                if "vulnerable" in out.stdout.lower() or "injectable" in out.stdout.lower():
-                    logger.error("SQL INJECTION DETECTED!")
-                    vulnerable = True
-                else:
-                    logger.log("No obvious SQLi found")
-        except subprocess.TimeoutExpired:
-            logger.warn("SQLMap timeout")
-        except FileNotFoundError:
-            logger.error("sqlmap not installed")
-        except Exception as e:
-            logger.error(f"SQLMap error: {e}")
-    return vulnerable
-
-
-def dir_fuzz(domain, logger, session, limiter):
-    logger.phase("DIRECTORY FUZZING")
-    found = []
-    for path in COMMON_DIRS:
-        for proto in ["http", "https"]:
-            url = f"{proto}://{domain}{path}"
-            try:
-                limiter.sleep()
-                r = safe_request(session, url, allow_redirects=False)
-                if r and r.status_code in (200, 301, 302, 401, 403):
-                    status = "OK" if r.status_code == 200 else "WARN"
-                    logger.log(f"[{r.status_code}] {url}", status)
-                    found.append((url, r.status_code, len(r.text)))
-            except Exception as e:
-                logger.debug(f"Dir fuzz error: {e}")
-    logger.ok(f"Found {len(found)} interesting paths")
-    return found
-
-
-def brute_login(domain, wordlist, logger, session, limiter):
-    logger.phase("LOGIN BRUTE-FORCE")
-    try:
-        with open(wordlist, "r", encoding="latin-1", errors="ignore") as f:
-            passwords = [line.strip() for line in f if line.strip()][:100]
-    except Exception:
-        passwords = ["123456", "password", "admin", "admin123", "root", "toor", "guest", "qwerty", "welcome", "changeme", "default", "secret", "test", "test123"]
-
-    candidates = []
-    for path in LOGIN_PATHS:
-        url = f"http://{domain}{path}"
-        try:
-            limiter.sleep()
-            baseline = safe_request(session, url)
-            if baseline is None:
-                continue
-            base_len = len(baseline.text)
-        except Exception:
-            continue
-
-        for user in COMMON_USERS:
-            for pwd in passwords[:10]:
-                try:
-                    limiter.sleep()
-                    data = {"username": user, "password": pwd, "log": user, "pwd": pwd}
-                    r = safe_request(session, url, method="POST", data=data, allow_redirects=False)
-                    if r is None:
-                        continue
-
-                    if is_success(r, base_len):
-                        logger.warn(f"CREDENTIALS? {user}:{pwd} @ {url}")
-                        candidates.append((url, user, pwd))
-                except Exception as e:
-                    logger.debug(f"Brute test error: {e}")
-
-    logger.ok(f"Brute-force finished. Candidates: {len(candidates)}")
-    return candidates
-
-
-def is_success(response, baseline_len):
-    if response.status_code in (301, 302, 303):
-        return True
-    text = response.text.lower()
-    if any(k in text[:800] for k in ["dashboard", "welcome", "logout", "admin panel", "profile"]):
-        return True
-    if abs(len(response.text) - baseline_len) > baseline_len * 0.25 and len(response.text) > 200:
-        if not any(k in text[:500] for k in ["error", "invalid", "wrong", "failed", "incorrect"]):
-            return True
-    return False
-
-
-def whois_lookup(domain, logger):
-    logger.phase("WHOIS")
-    if not whois:
-        logger.warn("python-whois not installed")
-        return None
-    try:
-        w = whois.whois(domain)
-        logger.ok(f"Registrar: {w.registrar}")
-        logger.ok(f"Creation: {w.creation_date}")
-        logger.ok(f"Emails: {w.emails}")
-        return {
-            "registrar": str(w.registrar),
-            "creation": str(w.creation_date),
-            "emails": str(w.emails)
-        }
-    except Exception as e:
-        logger.error(f"WHOIS failed: {e}")
-        return None
-
-
-def recursive_crawl(domain, logger, session, limiter, max_depth=2, max_pages=50):
-    logger.phase("RECURSIVE CRAWLER")
-
-    if not BS4_AVAILABLE:
-        logger.warn("BeautifulSoup4 not installed. Skipping crawler.")
-        return []
-
-    base_urls = [f"http://{domain}", f"https://{domain}"]
+def discover_site(target, manager, logger, max_pages=30, max_depth=2):
+    logger.phase("DISCOVERY")
+    base = f"https://{format_host(target)}"
     visited = set()
-    found_urls = []
-    queue = deque()
-
-    for base in base_urls:
-        queue.append((base, 0))
-
-    while queue and len(visited) < max_pages:
+    queue = deque([(base, 0)])
+    links, scripts, params, forms = [], set(), {}, []
+    while queue and len(visited) < max_pages and not manager.stop_reason:
         url, depth = queue.popleft()
-
-        if url in visited or depth > max_depth:
+        normalized = urlunparse(urlparse(url)._replace(fragment=""))
+        if normalized in visited:
             continue
-        visited.add(url)
-
-        try:
-            limiter.sleep()
-            r = safe_request(session, url)
-            if r is None or "text/html" not in r.headers.get("Content-Type", ""):
+        visited.add(normalized)
+        response = manager.request(normalized)
+        if response is None or "text/html" not in response.headers.get("Content-Type", "").lower():
+            continue
+        if BeautifulSoup is None:
+            logger.warn("beautifulsoup4 is missing; HTML discovery is disabled.")
+            break
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup.find_all(["a", "form", "script", "link"]):
+            raw = tag.get("href") or tag.get("src") or tag.get("action")
+            if not raw:
                 continue
-
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for tag in soup.find_all(["a", "form", "link", "script", "img"]):
-                href = tag.get("href") or tag.get("src") or tag.get("action")
-                if href:
-                    full_url = urljoin(url, href)
-                    parsed = urlparse(full_url)
-                    if parsed.netloc in (domain, f"www.{domain}", ""):
-                        if full_url not in visited:
-                            queue.append((full_url, depth + 1))
-                            found_urls.append(full_url)
-
-            logger.debug(f"Crawled [{r.status_code}] {url} | Found {len(found_urls)} links")
-
-        except Exception as e:
-            logger.debug(f"Crawl error: {e}")
-
-    unique_urls = list(set(found_urls))
-    logger.ok(f"Crawl complete. Total unique URLs: {len(unique_urls)}")
-    return unique_urls
-
-
-def extract_js_endpoints(domain, logger, session, limiter, crawled_urls):
-    logger.phase("JS ENDPOINT EXTRACTOR")
-
-    endpoints = set()
-    js_files = []
-    secret_hits = 0
-
-    for url in crawled_urls:
-        if url.endswith(".js") or ".js?" in url:
-            js_files.append(url)
-
-    if not js_files:
-        logger.warn("No JS files found in crawl. Trying direct fetch...")
-        for proto in ["http", "https"]:
-            try:
-                limiter.sleep()
-                r = safe_request(session, f"{proto}://{domain}")
-                if r is None or not BS4_AVAILABLE:
+            destination = urljoin(response.url, raw)
+            parsed = urlparse(destination)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            if tag.name == "script":
+                if parsed.hostname not in (target, f"www.{target}"):
+                    if not tag.get("integrity"):
+                        scripts.add((destination, response.url, False))
                     continue
-                soup = BeautifulSoup(r.text, "html.parser")
-                for script in soup.find_all("script", src=True):
-                    src = urljoin(f"{proto}://{domain}", script["src"])
-                    if ".js" in src:
-                        js_files.append(src)
-            except Exception as e:
-                logger.debug(f"JS fetch error: {e}")
-
-    endpoint_patterns = [
-        r'["\']((?:/api|/graphql|/rest|/v\d+|/auth|/admin|/user|/login|/logout|/register|/upload|/download|/search|/config)[^"\'\s]*)["\']',
-        r'(?:url|endpoint|path|route|baseURL)\s*[:=]\s*["\']([^"\']+)["\']',
-        r'fetch\(["\']([^"\']+)["\']',
-        r'axios\.(?:get|post|put|delete)\(["\']([^"\']+)["\']',
-        r'["\']((?:ws://|wss://)[^"\']+)["\']',
-    ]
-
-    for js_url in js_files[:20]:
-        try:
-            limiter.sleep()
-            r = safe_request(session, js_url)
-            if r is None:
+                scripts.add((destination, response.url, bool(tag.get("integrity"))))
+            if parsed.hostname not in (target, f"www.{target}"):
                 continue
-            js_content = r.text
-
-            for pattern in endpoint_patterns:
-                matches = re.findall(pattern, js_content, re.IGNORECASE)
-                for match in matches:
-                    if len(match) > 2:
-                        endpoints.add(match)
-
-            secrets_found = []
-            for pattern in SECRET_PATTERNS:
-                matches = re.findall(pattern, js_content, re.IGNORECASE)
-                secrets_found.extend(matches)
-
-            if secrets_found:
-                secret_hits += len(secrets_found)
-                logger.warn(f"SECRETS in {js_url}: {len(secrets_found)} potential leaks (masked)")
-
-            logger.debug(f"Parsed {js_url} | Endpoints: {len(endpoints)}")
-
-        except Exception as e:
-            logger.debug(f"JS parse error: {e}")
-
-    endpoints_list = sorted(list(endpoints))
-    logger.ok(f"Total unique endpoints found: {len(endpoints_list)}")
-    return endpoints_list, secret_hits
-
-
-def cors_check(domain, logger, session, limiter):
-    logger.phase("CORS MISCONFIGURATION CHECKS")
-
-    findings = []
-    test_urls = [f"http://{domain}", f"https://{domain}"]
-
-    for base_url in test_urls:
-        for origin in CORS_TEST_ORIGINS:
-            try:
-                limiter.sleep()
-                headers = {"Origin": origin, "User-Agent": USER_AGENT}
-                r = safe_request(session, base_url, headers=headers)
-                if r is None:
-                    continue
-
-                acao = r.headers.get("Access-Control-Allow-Origin", "")
-                acac = r.headers.get("Access-Control-Allow-Credentials", "")
-
-                if acao == "*" and acac.lower() == "true":
-                    logger.error(f"CRITICAL: Wildcard + Credentials on {base_url}")
-                    findings.append({"url": base_url, "origin": origin, "severity": "CRITICAL", "issue": "Wildcard with credentials"})
-                elif acao == origin:
-                    if acac.lower() == "true":
-                        logger.warn(f"HIGH: Reflecting origin with credentials: {origin}")
-                        findings.append({"url": base_url, "origin": origin, "severity": "HIGH", "issue": "Origin reflected with credentials"})
-                    else:
-                        logger.warn(f"MEDIUM: Reflecting origin without credentials: {origin}")
-                        findings.append({"url": base_url, "origin": origin, "severity": "MEDIUM", "issue": "Origin reflected without credentials"})
-                elif acao == "*":
-                    logger.warn(f"LOW: Wildcard CORS on {base_url}")
-                    findings.append({"url": base_url, "origin": origin, "severity": "LOW", "issue": "Wildcard CORS"})
-
-            except Exception as e:
-                logger.debug(f"CORS test error: {e}")
-
-    logger.ok(f"CORS checks complete. Findings: {len(findings)}")
-    return findings
-
-
-def jwt_analyze(domain, logger, session, limiter):
-    logger.phase("JWT ANALYZER")
-
-    if not JWT_AVAILABLE:
-        logger.warn("PyJWT not installed. Skipping JWT analysis.")
-        return []
-
-    findings = []
-
-    jwt_locations = [
-        f"http://{domain}", f"https://{domain}",
-        f"http://{domain}/api", f"https://{domain}/api",
-        f"http://{domain}/login", f"https://{domain}/login",
-    ]
-
-    collected_tokens = []
-
-    for url in jwt_locations:
-        try:
-            limiter.sleep()
-            r = safe_request(session, url)
-            if r is None:
+            if ACTION_PATH_PATTERN.search(parsed.path):
                 continue
-
-            jwt_pattern = r'eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'
-            tokens = re.findall(jwt_pattern, r.text)
-            collected_tokens.extend(tokens)
-
-            for cookie in r.cookies:
-                cookie_val = str(cookie.value)
-                if cookie_val.startswith("eyJ") and "." in cookie_val:
-                    collected_tokens.append(cookie_val)
-
-            auth_header = r.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer eyJ"):
-                collected_tokens.append(auth_header.replace("Bearer ", ""))
-
-        except Exception as e:
-            logger.debug(f"JWT fetch error: {e}")
-
-    unique_tokens = list(set(collected_tokens))
-
-    for token in unique_tokens[:10]:
-        try:
-            header = jwt.get_unverified_header(token)
-            payload = jwt.decode(token, options={"verify_signature": False})
-
-            logger.ok(f"JWT Found: alg={header.get('alg', 'unknown')}")
-            logger.log(f"  Payload keys: {list(payload.keys())}")
-
-            token_findings = {
-                "token_preview": mask_secret(token),
-                "algorithm": header.get("alg"),
-                "payload_keys": list(payload.keys()),
-                "issues": []
-            }
-
-            if header.get("alg") == "none":
-                logger.error("CRITICAL: JWT uses 'none' algorithm!")
-                token_findings["issues"].append("none_algorithm")
-
-            if header.get("alg") in ["HS256", "HS384", "HS512"]:
-                for secret in JWT_COMMON_SECRETS:
-                    try:
-                        jwt.decode(token, secret, algorithms=[header.get("alg")])
-                        logger.error("CRITICAL: JWT cracked with a common weak secret")
-                        token_findings["issues"].append("weak_secret")
-                        break
-                    except:
-                        pass
-
-            sensitive_keys = ["password", "secret", "admin", "role", "privilege", "email", "username", "id"]
-            for key in payload:
-                if any(sk in key.lower() for sk in sensitive_keys):
-                    logger.warn(f"JWT contains sensitive key: {key}")
-                    token_findings["issues"].append(f"sensitive_data:{key}")
-
-            findings.append(token_findings)
-
-        except Exception as e:
-            logger.debug(f"JWT parse error: {e}")
-
-    logger.ok(f"JWT analysis complete. Tokens analyzed: {len(findings)}")
-    return findings
-
-
-def take_screenshots(domain, logger, crawled_urls):
-    logger.phase("SCREENSHOT SYSTEM")
-
-    if not PLAYWRIGHT_AVAILABLE:
-        logger.warn("Playwright not installed. Skipping screenshots.")
-        return []
-
-    screenshots = []
-    screenshot_dir = f"screenshots_{domain}"
-    os.makedirs(screenshot_dir, exist_ok=True)
-
-    urls_to_shoot = [f"http://{domain}", f"https://{domain}"]
-    interesting_paths = ["/admin", "/login", "/dashboard", "/api", "/upload", "/config"]
-    for path in interesting_paths:
-        urls_to_shoot.append(f"http://{domain}{path}")
-        urls_to_shoot.append(f"https://{domain}{path}")
-
-    urls_to_shoot.extend(crawled_urls[:10])
-    urls_to_shoot = list(set(urls_to_shoot))
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1920, "height": 1080})
-
-            for url in urls_to_shoot:
-                try:
-                    page = context.new_page()
-                    page.goto(url, timeout=15000, wait_until="networkidle")
-
-                    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', url.replace("https://", "").replace("http://", ""))[:50]
-                    filename = f"{screenshot_dir}/{safe_name}.png"
-
-                    page.screenshot(path=filename, full_page=True)
-                    screenshots.append({"url": url, "file": filename})
-                    logger.ok(f"Screenshot: {url} -> {filename}")
-
-                    page.close()
-                except Exception as e:
-                    logger.warn(f"Screenshot failed for {url}: {e}")
-
-            browser.close()
-
-    except Exception as e:
-        logger.error(f"Playwright error: {e}")
-
-    logger.ok(f"Screenshots taken: {len(screenshots)}")
-    return screenshots
+            if parsed.query:
+                names = set(parse_qs(parsed.query, keep_blank_values=True))
+                if names:
+                    params.setdefault(destination, set()).update(names)
+            if tag.name == "form":
+                names = {
+                    field.get("name") for field in tag.find_all(["input", "textarea", "select"])
+                    if field.get("name")
+                }
+                action_url = urljoin(response.url, tag.get("action") or response.url)
+                method = (tag.get("method") or "get").lower()
+                form = {"url": action_url, "method": method, "parameters": sorted(names)}
+                forms.append(form)
+                if method == "get" and names:
+                    params.setdefault(action_url, set()).update(names)
+            links.append(destination)
+            if tag.name in ("a", "link") and depth < max_depth and not re.search(
+                r"\.(?:css|png|jpe?g|gif|svg|ico|woff2?|pdf)$", parsed.path, re.I
+            ):
+                queue.append((destination, depth + 1))
+    logger.ok(f"Discovered {len(set(links))} URLs, {len(scripts)} scripts, {len(params)} parameterized URLs.")
+    return list(dict.fromkeys(links)), list(scripts), params, forms
 
 
 class WebSecurityScanner:
     def __init__(self, domain, logger, session=None, limiter=None, active=False,
-                 max_requests=300, max_response_bytes=2_000_000, verify_tls=True):
+                 max_requests=300, max_response_bytes=MAX_BODY, verify_tls=True):
         self.domain = domain
         self.logger = logger
         self.session = session or requests.Session()
-        self.session.headers.update(HEADERS)
-        self.limiter = limiter or RateLimiter(0.3)
+        self.limiter = limiter or RateLimiter()
         self.active = active
-        self.max_requests = max_requests
-        self.max_response_bytes = max_response_bytes
         self.verify_tls = verify_tls
-        self.request_count = 0
+        self.manager = REQUEST_MANAGER or RequestManager(
+            self.session, logger, self.limiter, max_requests,
+            max_response_bytes=max_response_bytes,
+            allowed_hosts={domain, f"www.{domain}"},
+        )
         self.findings = []
-        self.base_https = f"https://{domain}"
-        self.base_http = f"http://{domain}"
-        self._resp_cache = {}
+        self._seen = set()
+        host = format_host(domain)
+        self.base_https = f"https://{host}"
+        self.base_http = f"http://{host}"
+        self.discovered_params = {}
+        self.discovered_scripts = []
 
-    def request_budget_left(self):
-        return self.request_count < self.max_requests
+    @property
+    def request_manager(self):
+        return self.manager
+
+    @request_manager.setter
+    def request_manager(self, value):
+        self.manager = value
+
+    def add(self, fid, title, severity, confidence, category, target, evidence,
+            description, remediation):
+        key = (fid, target, str(evidence))
+        if key in self._seen:
+            return None
+        self._seen.add(key)
+        finding = make_finding(fid, title, severity, confidence, category, target,
+                               evidence, description, remediation)
+        self.findings.append(finding)
+        self.logger.log(f"[{severity}] {title} @ {target}",
+                        "ERROR" if severity == "CRITICAL" else
+                        "WARN" if severity in ("HIGH", "MEDIUM") else "INFO")
+        return finding
 
     def get(self, url, **kwargs):
-        if not self.request_budget_left():
-            self.logger.warn(f"Request budget exhausted, skipping {url}")
-            return None
-        parsed = urlparse(url)
-        if parsed.hostname and not ssrf_guard(parsed.hostname, self.logger):
-            return None
-        self.limiter.sleep()
-        self.request_count += 1
-        kwargs.setdefault("timeout", TIMEOUT)
-        kwargs.setdefault("verify", self.verify_tls)
-        r = safe_request(self.session, url, method=kwargs.pop("method", "GET"), **kwargs)
-        if r is not None and len(r.content) > self.max_response_bytes:
-            self.logger.debug(f"Response truncated for {url}")
-        return r
+        return self.manager.request(url, kwargs.pop("method", "GET"), **kwargs)
 
-    def add(self, fid, title, severity, confidence, category, target, evidence, description, remediation, references=None):
-        f = make_finding(fid, title, severity, confidence, category, target, evidence, description, remediation, references)
-        self.findings.append(f)
-        level = "ERROR" if severity == "CRITICAL" else "WARN" if severity in ("HIGH", "MEDIUM") else "INFO"
-        self.logger.log(f"[{severity}] {title} @ {target}", level)
-        return f
-
-    def primary_response(self):
-        for url in (self.base_https, self.base_http):
-            if url in self._resp_cache:
-                if self._resp_cache[url] is not None:
-                    return url, self._resp_cache[url]
-                continue
-            r = self.get(url)
-            self._resp_cache[url] = r
-            if r is not None:
-                return url, r
+    def primary(self):
+        for candidate in (self.base_https, self.base_http):
+            response = self.get(candidate)
+            if response is not None:
+                return response.url, response
         return None, None
 
     def check_headers(self, url, response):
-        h = response.headers
-        is_https = url.startswith("https")
-
-        checks = [
-            ("Content-Security-Policy", "WEB-HEADER-001", "Missing Content-Security-Policy", "MEDIUM",
-             "CSP restricts which sources scripts, styles and other resources can load from, mitigating XSS and data injection.",
-             "Add a Content-Security-Policy header scoped to the origins the application actually needs."),
-            ("X-Content-Type-Options", "WEB-HEADER-002", "Missing X-Content-Type-Options", "LOW",
-             "Without this header browsers may MIME-sniff responses, which can enable content-type confusion attacks.",
-             "Set 'X-Content-Type-Options: nosniff' on all responses."),
-            ("Referrer-Policy", "WEB-HEADER-003", "Missing Referrer-Policy", "LOW",
-             "Without an explicit policy, browsers may leak full URLs (including sensitive query params) to third parties via the Referer header.",
-             "Set a Referrer-Policy such as 'strict-origin-when-cross-origin' or stricter."),
-            ("Permissions-Policy", "WEB-HEADER-004", "Missing Permissions-Policy", "LOW",
-             "Without this header, powerful browser features (camera, geolocation, etc.) are not explicitly restricted.",
-             "Add a Permissions-Policy that disables features the site does not use."),
-            ("Cross-Origin-Opener-Policy", "WEB-HEADER-005", "Missing Cross-Origin-Opener-Policy", "LOW",
-             "COOP isolates the browsing context from cross-origin windows, mitigating some cross-window attacks (e.g. Spectre-style leaks).",
-             "Set 'Cross-Origin-Opener-Policy: same-origin' where compatible with the application."),
-            ("Cross-Origin-Resource-Policy", "WEB-HEADER-006", "Missing Cross-Origin-Resource-Policy", "INFO",
-             "CORP controls whether other origins can embed this resource, reducing exposure to cross-origin leaks.",
-             "Set 'Cross-Origin-Resource-Policy: same-origin' or 'same-site' as appropriate."),
+        headers = {key.lower(): value for key, value in response.headers.items()}
+        required = {
+            "content-security-policy": ("WEB-HEADER-001", "Missing Content-Security-Policy", "MEDIUM",
+                "Add a restrictive policy based on the resources the application requires."),
+            "x-content-type-options": ("WEB-HEADER-002", "Missing X-Content-Type-Options", "LOW",
+                "Set X-Content-Type-Options: nosniff."),
+            "referrer-policy": ("WEB-HEADER-003", "Missing Referrer-Policy", "LOW",
+                "Set strict-origin-when-cross-origin or a stricter policy."),
+            "permissions-policy": ("WEB-HEADER-004", "Missing Permissions-Policy", "LOW",
+                "Disable browser capabilities that the application does not need."),
+            "cross-origin-opener-policy": ("WEB-HEADER-005", "Missing COOP", "LOW",
+                "Set Cross-Origin-Opener-Policy: same-origin where compatible."),
+            "cross-origin-resource-policy": ("WEB-HEADER-006", "Missing CORP", "INFO",
+                "Set same-origin or same-site according to resource sharing requirements."),
+        }
+        for name, (fid, title, severity, fix) in required.items():
+            if name not in headers:
+                self.add(fid, title, severity, "HIGH", "Headers", url,
+                         f"{name} header not present",
+                         "The browser receives no explicit policy for this security control.", fix)
+        if url.startswith("https://") and "strict-transport-security" not in headers:
+            self.add("WEB-HEADER-007", "Missing HSTS", "MEDIUM", "HIGH", "Headers", url,
+                     "Strict-Transport-Security header not present",
+                     "Browsers are not instructed to require HTTPS on future visits.",
+                     "After validating HTTPS site-wide, set a suitable HSTS max-age.")
+        hsts = headers.get("strict-transport-security", "")
+        match = re.search(r"max-age=(\d+)", hsts, re.I)
+        if match and int(match.group(1)) < 15_768_000:
+            self.add("WEB-HEADER-008", "HSTS max-age is short", "LOW", "MEDIUM", "Headers", url,
+                     hsts, "A short HSTS lifetime reduces repeat-visit protection.",
+                     "Use max-age of at least 15768000 seconds after HTTPS is stable.")
+        csp = headers.get("content-security-policy", "")
+        directives = {
+            part.strip().split()[0].lower(): part.strip().split()[1:]
+            for part in csp.split(";") if part.strip()
+        }
+        weak = [
+            name for name, values in directives.items()
+            if name in ("script-src", "default-src")
+            and any(value in values for value in ("'unsafe-inline'", "'unsafe-eval'", "*"))
         ]
-        for hdr, fid, title, sev, desc, rem in checks:
-            if hdr not in h:
-                self.add(fid, title, sev, "HIGH", "Headers", url, "Header not present in response", desc, rem)
-
-        if is_https and "Strict-Transport-Security" not in h:
-            self.add("WEB-HEADER-007", "Missing Strict-Transport-Security (HSTS)", "MEDIUM", "HIGH", "Headers", url,
-                      "Header not present on HTTPS response",
-                      "Without HSTS, browsers may be tricked into connecting over plain HTTP, enabling downgrade/MITM attacks.",
-                      "Set 'Strict-Transport-Security: max-age=31536000; includeSubDomains' once HTTPS is stable site-wide.")
-
-    def check_clickjacking(self, url, response):
-        h = response.headers
-        xfo = h.get("X-Frame-Options", "")
-        csp = h.get("Content-Security-Policy", "")
-        has_frame_ancestors = "frame-ancestors" in csp.lower()
-        if not xfo and not has_frame_ancestors:
-            self.add("WEB-CLICKJACK-001", "Missing Clickjacking Protection", "MEDIUM", "HIGH", "Clickjacking", url,
-                      "No X-Frame-Options and no CSP frame-ancestors directive",
-                      "The page can be embedded in a hidden iframe on an attacker site, enabling UI-redress (clickjacking) attacks.",
-                      "Set 'X-Frame-Options: DENY' or 'SAMEORIGIN', and/or a CSP 'frame-ancestors' directive.")
-
-    def check_csp_quality(self, url, response):
-        csp = response.headers.get("Content-Security-Policy")
-        if not csp:
-            return
-        directives = {}
-        for part in csp.split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            tokens = part.split()
-            directives[tokens[0].lower()] = tokens[1:]
-
-        for directive in ("script-src", "default-src"):
-            values = directives.get(directive)
-            if values is None:
-                continue
-            if "'unsafe-inline'" in values or "'unsafe-eval'" in values:
-                self.add("WEB-CSP-001", f"Weak CSP: {directive} allows unsafe-inline/unsafe-eval", "MEDIUM", "HIGH",
-                          "CSP", url, f"{directive}: {' '.join(values)}",
-                          "Allowing inline scripts or eval largely defeats CSP's protection against XSS.",
-                          f"Remove 'unsafe-inline'/'unsafe-eval' from {directive}; use nonces or hashes instead.")
-            if "*" in values:
-                self.add("WEB-CSP-002", f"Weak CSP: {directive} uses wildcard source", "MEDIUM", "HIGH",
-                          "CSP", url, f"{directive}: {' '.join(values)}",
-                          "A wildcard source allows loading resources from any origin, weakening CSP's restriction.",
-                          f"Scope {directive} to the specific origins the application needs.")
-        if "object-src" not in directives:
-            self.add("WEB-CSP-003", "CSP missing object-src restriction", "LOW", "MEDIUM", "CSP", url,
-                      "No object-src directive present",
-                      "Without object-src, plugin-based content (Flash/Java applets) is not explicitly restricted.",
-                      "Add \"object-src 'none'\" unless the application legitimately needs plugins.")
+        if weak:
+            self.add("WEB-CSP-001", "CSP contains broad script sources", "MEDIUM", "HIGH", "CSP",
+                     url, f"Weak directives: {weak}",
+                     "Unsafe inline/eval or wildcard sources weaken CSP's XSS mitigation.",
+                     "Use nonces/hashes and restrict script sources to required origins.")
+        if csp and "object-src" not in directives:
+            self.add("WEB-CSP-002", "CSP lacks object-src restriction", "LOW", "MEDIUM",
+                     "CSP", url, "No object-src directive",
+                     "Legacy plugin content is not explicitly restricted.",
+                     "Add object-src 'none' unless the application needs embedded plugins.")
 
     def check_cookies(self, url, response):
         try:
-            raw_cookies = response.raw.headers.getlist("Set-Cookie")
-        except Exception:
-            single = response.headers.get("Set-Cookie")
-            raw_cookies = [single] if single else []
-
-        for raw in raw_cookies:
-            if not raw:
+            cookie_headers = response.raw.headers.getlist("Set-Cookie")
+        except (AttributeError, TypeError):
+            value = response.headers.get("Set-Cookie")
+            cookie_headers = [value] if value else []
+        for raw in cookie_headers:
+            parts = [item.strip() for item in raw.split(";")]
+            if not parts:
                 continue
-            parts = [p.strip() for p in raw.split(";")]
-            name = parts[0].split("=")[0] if "=" in parts[0] else parts[0]
-            attrs = {p.split("=")[0].lower(): (p.split("=", 1)[1] if "=" in p else True) for p in parts[1:]}
+            name = parts[0].split("=", 1)[0]
+            attrs = {}
+            for part in parts[1:]:
+                key, _, value = part.partition("=")
+                attrs[key.lower()] = value or True
+            sensitive = bool(re.search(r"session|auth|token|sid|jwt", name, re.I))
+            evidence = f"Set-Cookie: {name}=********"
+            for flag, fid, title, severity in (
+                ("secure", "WEB-COOKIE-001", "Cookie missing Secure", "MEDIUM" if sensitive else "LOW"),
+                ("httponly", "WEB-COOKIE-002", "Cookie missing HttpOnly", "MEDIUM" if sensitive else "LOW"),
+                ("samesite", "WEB-COOKIE-003", "Cookie missing SameSite", "LOW"),
+            ):
+                if flag not in attrs and (flag != "secure" or url.startswith("https://")):
+                    self.add(fid, f"{title}: {name}", severity, "HIGH", "Cookies", url, evidence,
+                             f"The {name} cookie lacks the {flag} attribute.",
+                             f"Set the {flag.title()} attribute on cookies as appropriate.")
+            if str(attrs.get("samesite", "")).lower() == "none" and "secure" not in attrs:
+                self.add("WEB-COOKIE-004", f"SameSite=None without Secure: {name}", "MEDIUM", "HIGH",
+                         "Cookies", url, evidence,
+                         "Browsers require Secure for SameSite=None cookies.",
+                         "Pair SameSite=None with Secure.")
 
-            looks_sensitive = any(k in name.lower() for k in ["session", "auth", "token", "sid", "jwt"])
+    def check_cors(self, url):
+        findings = []
+        for origin in ("https://evil.example", "null"):
+            response = self.get(url, headers={"Origin": origin})
+            if response is None:
+                break
+            allow = response.headers.get("Access-Control-Allow-Origin", "")
+            credentials = response.headers.get("Access-Control-Allow-Credentials", "").lower() == "true"
+            if allow == origin and credentials:
+                severity = "HIGH"
+                title = "Untrusted origin reflected with credentials"
+            elif allow == "*" and credentials:
+                severity = "LOW"
+                title = "Wildcard CORS with credentials signal"
+            elif allow == origin:
+                severity = "MEDIUM"
+                title = "Untrusted origin reflected by CORS"
+            elif allow == "*":
+                severity = "LOW"
+                title = "Wildcard CORS policy"
+            else:
+                continue
+            finding = self.add(
+                "WEB-CORS-001", title, severity, "HIGH", "CORS", url,
+                f"Origin={origin}; ACAO={allow}; ACAC={credentials}",
+                "A permissive cross-origin response policy may allow unwanted cross-origin access.",
+                "Restrict Access-Control-Allow-Origin to explicit trusted origins and avoid credentialed wildcard policies.",
+            )
+            if finding:
+                findings.append(finding)
+        return findings
 
-            if "secure" not in attrs and url.startswith("https"):
-                self.add("WEB-COOKIE-001", f"Cookie missing Secure flag: {name}", "MEDIUM" if looks_sensitive else "LOW",
-                          "HIGH", "Cookies", url, f"Set-Cookie: {name}=********",
-                          "Without Secure, this cookie can be transmitted over plain HTTP and intercepted in transit.",
-                          "Add the 'Secure' attribute to all cookies served over HTTPS.")
-            if "httponly" not in attrs:
-                self.add("WEB-COOKIE-002", f"Cookie missing HttpOnly flag: {name}", "MEDIUM" if looks_sensitive else "LOW",
-                          "HIGH", "Cookies", url, f"Set-Cookie: {name}=********",
-                          "Without HttpOnly, client-side scripts can read this cookie, increasing impact of any XSS.",
-                          "Add the 'HttpOnly' attribute to session/auth cookies.")
-            samesite = attrs.get("samesite")
-            if not samesite:
-                self.add("WEB-COOKIE-003", f"Cookie missing SameSite attribute: {name}", "LOW", "MEDIUM", "Cookies",
-                          url, f"Set-Cookie: {name}=********",
-                          "Without SameSite, the cookie may be sent on cross-site requests, weakening CSRF defenses.",
-                          "Set 'SameSite=Lax' or 'Strict' depending on the application's cross-site needs.")
-            elif str(samesite).lower() == "none" and "secure" not in attrs:
-                self.add("WEB-COOKIE-004", f"Cookie SameSite=None without Secure: {name}", "MEDIUM", "HIGH",
-                          "Cookies", url, f"Set-Cookie: {name}=********",
-                          "SameSite=None cookies must be Secure or browsers will reject/strip them, and without Secure the cookie is also exposed on plain HTTP.",
-                          "Pair 'SameSite=None' with the 'Secure' attribute.")
+    def check_exposure(self):
+        self.logger.phase("WEB SECURITY")
+        for path, (label, expected) in COMMON_SENSITIVE_PATHS.items():
+            if self.manager.stop_reason:
+                break
+            url = self.base_https + path
+            response = self.get(url)
+            if response is None or response.status_code != 200 or not response.content:
+                continue
+            text = response.text[:4000]
+            if path in ("/robots.txt", "/sitemap.xml", "/.well-known/security.txt"):
+                if path == "/robots.txt":
+                    interesting = [
+                        item for item in re.findall(r"^\s*Disallow:\s*(\S+)", text, re.I | re.M)
+                        if re.search(r"admin|config|backup|private|internal", item, re.I)
+                    ]
+                    if interesting:
+                        self.add(
+                            "WEB-ROBOTS-001", "robots.txt lists sensitive-looking paths",
+                            "LOW", "MEDIUM", "Discovery", response.url,
+                            f"{len(interesting)} sensitive-looking path(s) listed",
+                            "robots.txt is public and does not restrict access to listed paths.",
+                            "Use authorization controls rather than relying on robots.txt to hide sensitive routes.",
+                        )
+                elif path == "/.well-known/security.txt":
+                    contacts = len(re.findall(r"^Contact\s*:", text, re.I | re.M))
+                    self.add(
+                        "WEB-SECURITYTXT-001", "security.txt is publicly available",
+                        "INFO", "HIGH", "Security Contact", response.url,
+                        f"Contact fields: {contacts}",
+                        "A published security.txt gives researchers a standard reporting contact.",
+                        "Keep security contact and policy details current.",
+                    )
+                continue
+            if path.endswith((".zip", ".gz")):
+                valid = response.content.startswith(b"PK\x03\x04") or "application/zip" in response.headers.get("Content-Type", "")
+            elif expected is None:
+                valid = True
+            else:
+                valid = bool(expected.search(text))
+            if valid:
+                self.add("WEB-EXPOSE-001", f"Potentially exposed resource: {label}", "HIGH", "MEDIUM",
+                         "Exposure", response.url, "Resource appears accessible; body content is not included in evidence.",
+                         f"A public {label.lower()} can expose sensitive implementation or operational data.",
+                         "Restrict access or remove the resource from public web roots. Rotate secrets if exposure is confirmed.")
+        for path in ("/", "/uploads/", "/files/"):
+            response = self.get(self.base_https + path)
+            if response is None or response.status_code != 200:
+                continue
+            if re.search(r"<title>\s*index of /|<h1>\s*index of /", response.text[:4000], re.I):
+                self.add("WEB-DIRLIST-001", "Directory listing appears enabled", "MEDIUM", "MEDIUM",
+                         "Directory Exposure", response.url, "An 'Index of /' listing marker was observed",
+                         "Directory listings expose filenames and may reveal backups or source files.",
+                         "Disable automatic directory indexing.")
+                break
+        for url in self.discovered_urls:
+            parsed = urlparse(url)
+            if not re.search(r"\.(?:bak|old|orig|backup|map)$", parsed.path, re.I):
+                continue
+            response = self.get(url)
+            if response and response.status_code == 200 and response.content:
+                self.add("WEB-BACKUP-001", "Backup or source-map URL discovered", "LOW", "MEDIUM",
+                         "Exposure", response.url, "HTTP 200 with non-empty response",
+                         "Backup files or source maps can reveal source code or internal paths.",
+                         "Remove unnecessary artifacts from public deployment directories.")
+
+    def check_response_disclosure(self, url, response):
+        headers = response.headers
+        for name in ("Server", "X-Powered-By"):
+            value = headers.get(name)
+            if value and re.search(r"\d+\.\d+", value):
+                self.add("WEB-INFO-001", f"{name} discloses version information", "LOW", "HIGH",
+                         "Information Disclosure", url, f"{name}: {value}",
+                         "Version information can help identify software with known vulnerabilities.",
+                         f"Suppress or generalize the {name} response header.")
+        body = response.text
+        for pattern in ERROR_PATTERNS:
+            match = re.search(pattern, body, re.I)
+            if match:
+                self.add("WEB-INFO-002", "Verbose error or stack trace exposed", "MEDIUM", "MEDIUM",
+                         "Information Disclosure", url, f"Matched pattern: {match.group(0)[:120]}",
+                         "Diagnostic output may reveal implementation and filesystem details.",
+                         "Disable debug responses in production and return generic error pages.")
+                break
+        path_match = re.search(r"(?:/var/www/|/home/[\w-]+/|/srv/[^ <\"']+)", body)
+        internal_ip = re.search(
+            r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|"
+            r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b", body
+        )
+        match = path_match or internal_ip
+        if match:
+            self.add("WEB-INFO-003", "Internal path or IP disclosed", "LOW", "LOW",
+                     "Information Disclosure", url, match.group(0)[:160],
+                     "The response contains a filesystem path or private IP address.",
+                     "Remove internal diagnostics from production responses.")
+        if response.status_code == 200 and re.search(
+            r"<title>\s*(?:Apache2 Debian Default Page|Welcome to nginx|IIS Windows Server)",
+            body, re.I,
+        ):
+            self.add("WEB-DEFAULT-001", "Default server landing page detected", "LOW", "MEDIUM",
+                     "Default Configuration", url, "Known default-page title observed",
+                     "The host may be serving an uncustomized default page or incorrect virtual host.",
+                     "Remove the default page and verify the virtual-host configuration.")
+        if response.status_code >= 500:
+            self.add("WEB-STATUS-001", f"Server error response (HTTP {response.status_code})", "LOW",
+                     "MEDIUM", "Response Behavior", url, f"HTTP {response.status_code}",
+                     "An ordinary request returned a server-side failure.",
+                     "Review application and edge logs and return consistent safe error responses.")
+        cache = headers.get("Cache-Control", "").lower()
+        if re.search(r"login|account|profile|admin|dashboard", url, re.I):
+            if "no-store" not in cache:
+                self.add("WEB-CACHE-001", "Sensitive route lacks no-store cache policy", "LOW", "MEDIUM",
+                         "Cache", url, f"Cache-Control: {cache or '(missing)'}",
+                         "Sensitive responses may be retained by browsers or intermediary caches.",
+                         "Use Cache-Control: no-store for authenticated or user-specific responses.")
+            if "public" in cache:
+                self.add("WEB-CACHE-002", "Sensitive route marked publicly cacheable", "MEDIUM", "MEDIUM",
+                         "Cache", url, f"Cache-Control: {cache}",
+                         "Shared caches could retain a response intended for a specific user.",
+                         "Use private/no-store cache directives for authenticated responses.")
+        encoding = headers.get("Content-Encoding", "")
+        if encoding and re.search(r"login|account|profile|token", url, re.I):
+            self.add("WEB-COMPRESS-001", "Compression enabled on potentially sensitive route", "INFO", "LOW",
+                     "Compression", url, f"Content-Encoding: {encoding}",
+                     "Compression can contribute to side-channel risks when secrets and attacker-controlled data share responses.",
+                     "Review application-specific mitigations for compressed secret-bearing responses.")
+
+    def check_content(self, url, response):
+        body = response.text
+        if url.startswith("https://"):
+            mixed = re.findall(r"""(?:src|href|action)=["'](http://[^"']+)""", body, re.I)
+            if mixed:
+                self.add("WEB-MIXED-001", "HTTP resource referenced from HTTPS page", "MEDIUM", "MEDIUM",
+                         "Mixed Content", url, mixed[0],
+                         "An HTTP subresource may be modified in transit.",
+                         "Load subresources over HTTPS.")
+        if BeautifulSoup is None:
+            return
+        soup = BeautifulSoup(body, "html.parser")
+        for script in soup.find_all("script", src=True):
+            script_url = urljoin(url, script["src"])
+            host = urlparse(script_url).hostname
+            if host and host not in (self.domain, f"www.{self.domain}") and not script.get("integrity"):
+                self.add("WEB-SRI-001", "Third-party script has no SRI metadata", "LOW", "MEDIUM",
+                         "Third-party Resources", script_url, "External script missing integrity attribute",
+                         "A compromised external script executes with the application's page privileges.",
+                         "Use Subresource Integrity for immutable third-party scripts.")
+        for form in soup.find_all("form"):
+            action = urljoin(url, form.get("action") or url)
+            password = form.find("input", {"type": "password"})
+            if password and action.startswith("http://"):
+                self.add("WEB-FORM-001", "Password form submits over HTTP", "HIGH", "HIGH",
+                         "Forms", url, f"Form action: {action}",
+                         "Credentials submitted over HTTP can be intercepted.",
+                         "Serve the form action exclusively over HTTPS.")
+            if password and not password.get("autocomplete"):
+                self.add("WEB-AUTH-001", "Password form has no explicit autocomplete policy",
+                         "INFO", "LOW", "Authentication", url, "Password input lacks autocomplete attribute",
+                         "Explicit autocomplete values communicate login/password-reset behavior to browsers.",
+                         "Set autocomplete=current-password or new-password according to the form purpose.")
+        csp = response.headers.get("Content-Security-Policy", "").lower()
+        if "x-frame-options" not in {key.lower() for key in response.headers} and (
+            not csp or "frame-ancestors" not in csp
+        ):
+            self.add("WEB-CLICKJACK-001", "Missing clickjacking protection", "MEDIUM", "HIGH",
+                     "Headers", url, "No CSP frame-ancestors or X-Frame-Options header",
+                     "The page may be embedded in a hostile frame.",
+                     "Set CSP frame-ancestors or X-Frame-Options as compatible with the application.")
+
+    def check_api(self):
+        self.logger.phase("APPLICATION SECURITY / API DISCOVERY")
+        for path in API_PATHS:
+            if self.manager.stop_reason:
+                return
+            response = self.get(self.base_https + path)
+            if response is None or response.status_code not in (200, 400, 401, 403, 405):
+                continue
+            if "swagger" in path or "openapi" in path or "api-docs" in path:
+                if response.status_code == 200:
+                    self.add("WEB-API-001", "API documentation endpoint is public", "MEDIUM", "HIGH",
+                             "API Discovery", response.url, f"HTTP {response.status_code}",
+                             "Public API documentation can disclose endpoints and data models.",
+                             "Restrict documentation to authorized users or internal environments.")
+            else:
+                self.add("WEB-API-002", "GraphQL endpoint signal observed", "INFO", "MEDIUM",
+                         "API Discovery", response.url, f"HTTP {response.status_code}",
+                         "A GraphQL-like endpoint is present and should enforce authorization and query limits.",
+                         "Review introspection policy, authorization, and query complexity controls.")
+
+    def check_source_maps(self, scripts):
+        for script_url, _, _ in scripts[:10]:
+            if self.manager.stop_reason:
+                break
+            parsed = urlparse(script_url)
+            if parsed.hostname not in (self.domain, f"www.{self.domain}") or not parsed.path.endswith(".js"):
+                continue
+            map_url = urlunparse(parsed._replace(path=parsed.path + ".map"))
+            response = self.get(map_url)
+            if response is None or response.status_code != 200:
+                continue
+            try:
+                payload = response.json()
+            except (ValueError, requests.exceptions.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("sources"), list):
+                self.add("WEB-SOURCEMAP-001", "JavaScript source map is public", "LOW", "MEDIUM",
+                         "Source Exposure", map_url, f"Source map contains {len(payload['sources'])} sources",
+                         "Source maps can reveal original source filenames and implementation details.",
+                         "Remove production maps or restrict access; do not include secrets in client bundles.")
+
+    def check_waf_rate(self, url, response):
+        headers = {key.lower(): value for key, value in response.headers.items()}
+        waf = [name for key, name in (
+            ("cf-ray", "Cloudflare"), ("x-sucuri-id", "Sucuri"),
+            ("x-iinfo", "Imperva"), ("x-akamai", "Akamai"),
+        ) if key in headers]
+        if any(key.startswith(("ratelimit-", "x-ratelimit-")) for key in headers):
+            self.add("WEB-RATE-001", "Rate-limit metadata observed", "INFO", "MEDIUM",
+                     "Rate Limiting", url,
+                     ", ".join(key for key in headers if key.startswith(("ratelimit-", "x-ratelimit-"))),
+                     "Rate-related headers appeared in an ordinary response; enforcement is not confirmed.",
+                     "Validate throttling thresholds using approved low-volume operational tests.")
+        if waf:
+            self.add("WEB-WAF-001", "WAF/CDN response signals observed", "INFO", "MEDIUM",
+                     "WAF/CDN", url, ", ".join(waf),
+                     "Response headers indicate an edge service; this does not verify rule coverage.",
+                     "Keep edge policies consistent across application and API routes.")
+
+    def check_traffic(self, url):
+        self.logger.phase("CONTROLLED TRAFFIC")
+        old_delay = self.manager.limiter.delay
+        self.manager.limiter.delay = max(old_delay, 1.0)
+        observations = []
+        try:
+            for _ in range(2):
+                if self.manager.stop_reason:
+                    break
+                response = self.get(url, headers={"Cache-Control": "no-cache"})
+                if response is None:
+                    break
+                observations.append(response.status_code)
+                if response.status_code in (429, 503):
+                    break
+        finally:
+            self.manager.limiter.delay = old_delay
+        if observations:
+            self.add("WEB-RATE-002", "Low-volume response behavior recorded", "INFO", "LOW",
+                     "DoS Protection", url, f"At most two paced GETs: HTTP {observations}",
+                     "This bounded check observes responses only; it is not a load test.",
+                     "Use service telemetry to validate rate limits and connection protections.")
+
+    def check_controlled_traffic(self, url):
+        return self.check_traffic(url)
+
+    def check_active_inputs(self, params, injection=False):
+        self.logger.phase("APPLICATION SECURITY / INPUT CHECKS")
+        marker = "latent" + secrets.token_hex(5)
+        tests = 0
+        for url, names in params.items():
+            parsed = urlparse(url)
+            for name in sorted(names):
+                if tests >= (10 if injection else 20) or self.manager.stop_reason:
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                query[name] = ["'" + marker if injection else marker]
+                test_url = urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+                baseline = self.get(url) if injection else None
+                response = self.get(test_url) if not injection or baseline is not None else None
+                tests += 1
+                if response is None or marker not in response.text:
+                    continue
+                if injection:
+                    baseline_signatures = {
+                        pattern for pattern in ERROR_PATTERNS
+                        if re.search(pattern, baseline.text, re.I)
+                    }
+                    new_signatures = [
+                        pattern for pattern in ERROR_PATTERNS
+                        if pattern not in baseline_signatures and re.search(pattern, response.text, re.I)
+                    ]
+                    if not new_signatures:
+                        continue
+                title = "Quote marker correlated with response" if injection else "Input marker reflected"
+                self.add(
+                    "WEB-INPUT-001" if injection else "WEB-XSS-REFLECT-001",
+                    title, "INFO", "LOW", "Application Security", test_url,
+                    f"Parameter={name}; harmless marker reflected; HTTP {response.status_code}"
+                    + (f"; new error signatures={new_signatures[:3]}" if injection else ""),
+                    "Marker reflection is an indicator only and does not confirm executable XSS or injection.",
+                    "Use context-sensitive output encoding and parameterized queries; validate the sink manually.",
+                )
+
+    def check_dns(self):
+        self.logger.phase("NETWORK / DNS")
+        if dns is None:
+            self.logger.warn("dnspython is not installed; DNS posture checks are skipped.")
+            return
+        try:
+            ipaddress.ip_address(self.domain)
+            self.logger.warn("SPF/DMARC/DNSSEC checks need a hostname, not an IP target.")
+            return
+        except ValueError:
+            pass
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 2
+        resolver.lifetime = 3
+        resolver.use_edns(edns=0, ednsflags=dns.flags.DO)
+
+        def query(name, kind):
+            try:
+                answer = resolver.resolve(name, kind, raise_on_no_answer=False)
+                return answer, answer.response
+            except dns.exception.DNSException:
+                return None, None
+
+        txt, _ = query(self.domain, "TXT")
+        values = [
+            b"".join(record.strings).decode("utf-8", "replace")
+            for record in (txt or [])
+        ]
+        spf = [item for item in values if item.lower().startswith("v=spf1")]
+        if not spf:
+            self.add("DNS-SPF-001", "SPF record not observed", "LOW", "MEDIUM", "DNS",
+                     self.domain, "No v=spf1 TXT value found",
+                     "Mail receivers have no SPF policy from this domain to evaluate sender authorization.",
+                     "Publish an SPF record for authorized senders.")
+        elif len(spf) > 1:
+            self.add("DNS-SPF-002", "Multiple SPF records observed", "MEDIUM", "HIGH", "DNS",
+                     self.domain, f"{len(spf)} SPF records found",
+                     "Multiple SPF records can cause evaluation errors.",
+                     "Consolidate senders into a single SPF record.")
+        dmarc, _ = query(f"_dmarc.{self.domain}", "TXT")
+        if not any(
+            b"".join(record.strings).decode("utf-8", "replace").lower().startswith("v=dmarc1")
+            for record in (dmarc or [])
+        ):
+            self.add("DNS-DMARC-001", "DMARC record not observed", "LOW", "MEDIUM", "DNS",
+                     self.domain, f"No v=DMARC1 TXT value at _dmarc.{self.domain}",
+                     "Receivers have no domain-published DMARC handling policy.",
+                     "Publish a DMARC policy and tune it using aggregate reports.")
+        dnskey, response = query(self.domain, "DNSKEY")
+        authenticated = bool(
+            dnskey and response and
+            (response.flags & dns.flags.AD or any(
+                rrset.rdtype == dns.rdatatype.RRSIG
+                for rrset in list(response.answer) + list(response.authority)
+            ))
+        )
+        if not authenticated:
+            self.add("DNS-DNSSEC-001", "DNSSEC validation signal not observed", "INFO", "LOW", "DNS",
+                     self.domain, "No authenticated DNSKEY response signal",
+                     "DNS answers may lack DNSSEC authentication in some resolver paths.",
+                     "Confirm signing and validation with authoritative and validating resolvers.")
+
+    def check_dns_posture(self):
+        return self.check_dns()
 
     def check_tls(self):
-        if not self.request_budget_left():
+        self.logger.phase("NETWORK / TLS")
+        if self.manager.stop_reason or not self.manager.reserve():
             return
         host = self.domain
+        if not is_public_target(host):
+            self.manager.stop("TLS probe blocked because target is not publicly routable")
+            return
         try:
-            ctx = ssl.create_default_context()
-            with socket.create_connection((host, 443), timeout=TIMEOUT) as sock:
-                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                    cert = ssock.getpeercert()
-                    tls_version = ssock.version()
-        except ssl.SSLCertVerificationError as e:
-            self.add("WEB-TLS-001", "TLS certificate validation failed", "HIGH", "HIGH", "TLS", f"https://{host}",
-                      str(e), "The presented certificate could not be validated against trusted CAs, which breaks the HTTPS trust guarantee.",
-                      "Install a valid certificate from a trusted CA covering this hostname.")
-            return
-        except Exception as e:
-            self.logger.debug(f"TLS connect error: {e}")
-            return
-
-        self.request_count += 1
-
-        if tls_version in ("TLSv1", "TLSv1.1", "SSLv3", "SSLv2"):
-            self.add("WEB-TLS-002", f"Weak TLS protocol negotiated: {tls_version}", "HIGH", "HIGH", "TLS",
-                      f"https://{host}", f"Negotiated protocol: {tls_version}",
-                      "Old TLS/SSL versions have known cryptographic weaknesses.",
-                      "Disable TLS 1.0/1.1 and SSLv3 on the server; require TLS 1.2 or newer.")
-
-        not_after = cert.get("notAfter")
-        if not_after:
-            try:
+            self.manager.limiter.sleep()
+            context = ssl.create_default_context()
+            with socket.create_connection((host, 443), timeout=TIMEOUT) as raw:
+                with context.wrap_socket(raw, server_hostname=host) as secure:
+                    cert = secure.getpeercert()
+                    negotiated = secure.version()
+            if negotiated in ("TLSv1", "TLSv1.1", "SSLv3", "SSLv2"):
+                self.add("WEB-TLS-001", f"Weak protocol negotiated: {negotiated}", "HIGH", "HIGH",
+                         "TLS", self.base_https, negotiated,
+                         "The server negotiated an obsolete TLS protocol.",
+                         "Require TLS 1.2 or newer.")
+            not_after = cert.get("notAfter")
+            if not_after:
                 expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                days_left = (expiry - datetime.utcnow()).days
-                if days_left < 0:
-                    self.add("WEB-TLS-003", "TLS certificate expired", "CRITICAL", "HIGH", "TLS", f"https://{host}",
-                              f"notAfter={not_after}", "The certificate has expired; browsers will show hard warnings or block access.",
-                              "Renew the TLS certificate immediately.")
-                elif days_left < 14:
-                    self.add("WEB-TLS-004", f"TLS certificate expiring soon ({days_left}d)", "MEDIUM", "HIGH",
-                              "TLS", f"https://{host}", f"notAfter={not_after}",
-                              "The certificate will expire soon; an outage or trust warning is imminent if not renewed.",
-                              "Renew the TLS certificate well before expiry and automate renewal if possible.")
-            except Exception:
-                pass
+                days = (expiry - datetime.utcnow()).days
+                if days < 0:
+                    self.add("WEB-TLS-002", "TLS certificate expired", "CRITICAL", "HIGH", "TLS",
+                             self.base_https, not_after, "The certificate is expired.",
+                             "Renew the certificate immediately.")
+                elif days < 14:
+                    self.add("WEB-TLS-003", "TLS certificate expires soon", "MEDIUM", "HIGH",
+                             "TLS", self.base_https, f"{days} days remaining",
+                             "The certificate expires within 14 days.",
+                             "Renew the certificate before expiry.")
+        except ssl.SSLCertVerificationError as exc:
+            self.add("WEB-TLS-004", "TLS certificate validation failed", "HIGH", "HIGH",
+                     "TLS", self.base_https, str(exc),
+                     "The certificate could not be validated by the local trust store.",
+                     "Install a valid trusted certificate matching the hostname.")
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            self.logger.debug(f"TLS probe unavailable: {exc}")
 
-        san_hosts = []
-        for entry_type, entry_val in cert.get("subjectAltName", []):
-            if entry_type == "DNS":
-                san_hosts.append(entry_val)
-        hostname_ok = False
-        for san in san_hosts:
-            pattern = "^" + re.escape(san).replace(r"\*", "[^.]+") + "$"
-            if re.match(pattern, host):
-                hostname_ok = True
-                break
-        if san_hosts and not hostname_ok:
-            self.add("WEB-TLS-005", "Certificate hostname mismatch", "HIGH", "MEDIUM", "TLS", f"https://{host}",
-                      f"SAN entries: {san_hosts}", "The certificate's Subject Alternative Names do not appear to cover the requested hostname.",
-                      "Issue a certificate that explicitly covers this hostname.")
-
-    def check_http_methods(self, url):
-        if not self.request_budget_left():
-            return
-        r = self.get(url, method="OPTIONS")
-        if r is None:
-            return
-        allow = r.headers.get("Allow", "")
-        methods = [m.strip().upper() for m in allow.split(",") if m.strip()]
-        dangerous = [m for m in methods if m in ("PUT", "DELETE", "TRACE", "CONNECT")]
-        if dangerous:
-            self.add("WEB-METHOD-001", f"Potentially dangerous HTTP methods enabled: {', '.join(dangerous)}",
-                      "MEDIUM", "MEDIUM", "HTTP Methods", url, f"Allow: {allow}",
-                      "Methods like PUT/DELETE/TRACE, if not properly access-controlled, can allow file writes, deletions, or Cross-Site Tracing.",
-                      "Disable unused HTTP methods at the web server or framework routing layer.")
-
-    def check_redirects(self, base_url):
-        if not self.request_budget_left():
-            return
-        current = base_url
-        chain = [current]
-        for _ in range(10):
-            r = self.get(current, allow_redirects=False)
-            if r is None or r.status_code not in (301, 302, 303, 307, 308):
-                break
-            loc = r.headers.get("Location")
-            if not loc:
-                break
-            nxt = urljoin(current, loc)
-            chain.append(nxt)
-            if nxt.startswith("http://") and current.startswith("https://"):
-                self.add("WEB-REDIRECT-001", "HTTPS to HTTP downgrade redirect", "HIGH", "HIGH", "Redirects",
-                          base_url, f"{current} -> {nxt}",
-                          "An HTTPS page redirecting to plain HTTP exposes users to interception and defeats the purpose of TLS.",
-                          "Never redirect an HTTPS URL to an HTTP destination.")
-            current = nxt
-
-        if len(chain) > 5:
-            self.add("WEB-REDIRECT-002", f"Excessive redirect chain ({len(chain)} hops)", "LOW", "MEDIUM",
-                      "Redirects", base_url, " -> ".join(chain), "Long redirect chains slow page loads and can indicate misconfiguration.",
-                      "Reduce the number of chained redirects to at most one or two hops.")
-
-        if base_url.startswith("http://"):
-            https_ok = any(u.startswith("https://") for u in chain)
-            if not https_ok:
-                self.add("WEB-REDIRECT-003", "No HTTP to HTTPS redirect", "MEDIUM", "HIGH", "Redirects", base_url,
-                          f"Chain stayed on HTTP: {chain}",
-                          "Visitors using plain HTTP are never upgraded to an encrypted connection.",
-                          "Redirect all HTTP requests to the HTTPS equivalent.")
-
-    def check_info_disclosure(self, url, response):
-        h = response.headers
-        if "Server" in h and re.search(r"\d+\.\d+", h["Server"]):
-            self.add("WEB-INFO-001", "Server header discloses version information", "LOW", "HIGH",
-                      "Information Disclosure", url, f"Server: {h['Server']}",
-                      "Version strings in the Server header help attackers match known vulnerabilities to the exact software version.",
-                      "Suppress or generalize the Server header at the web server / proxy layer.")
-        if "X-Powered-By" in h:
-            self.add("WEB-INFO-002", "X-Powered-By header discloses backend technology", "LOW", "HIGH",
-                      "Information Disclosure", url, f"X-Powered-By: {h['X-Powered-By']}",
-                      "This header reveals backend framework/language details useful for targeted attacks.",
-                      "Disable the X-Powered-By header in the application/framework configuration.")
-
-        body = response.text
-        for pattern in ERROR_SIGNATURES:
-            if re.search(pattern, body):
-                self.add("WEB-INFO-003", "Application error/debug information exposed", "MEDIUM", "MEDIUM",
-                          "Information Disclosure", url, f"Pattern matched: {pattern}",
-                          "Stack traces or verbose error pages can leak file paths, library versions and internal logic.",
-                          "Disable debug/verbose error output in production and use generic error pages.")
-                break
-
-    def check_cache_security(self, url, response):
-        h = response.headers
-        sensitive = any(k in url.lower() for k in ["login", "admin", "account", "dashboard", "profile", "checkout"])
-        cache_control = h.get("Cache-Control", "")
-        if sensitive and "no-store" not in cache_control.lower():
-            self.add("WEB-CACHE-001", "Sensitive page missing no-store cache directive", "LOW", "MEDIUM",
-                      "Cache", url, f"Cache-Control: {cache_control or '(none)'}",
-                      "Sensitive pages without 'no-store' may be cached by browsers or intermediate proxies.",
-                      "Set 'Cache-Control: no-store' on authentication and account-sensitive pages.")
-
-    def check_mixed_content(self, url, response):
-        if not url.startswith("https"):
-            return
-        body = response.text
-        refs = re.findall(r'(?:src|href|action)=["\']http://[^"\']+["\']', body, re.IGNORECASE)
-        if refs:
-            self.add("WEB-MIXED-001", f"Mixed content: {len(refs)} HTTP resource reference(s) on HTTPS page",
-                      "MEDIUM", "MEDIUM", "Mixed Content", url, refs[0],
-                      "Loading subresources over plain HTTP on an HTTPS page can be intercepted or modified in transit.",
-                      "Update all resource references to HTTPS or protocol-relative URLs.")
-
-    def check_forms(self, url, response):
-        if not BS4_AVAILABLE:
-            return
-        soup = BeautifulSoup(response.text, "html.parser")
-        for form in soup.find_all("form"):
-            action = form.get("action", "")
-            full_action = urljoin(url, action) if action else url
-            has_password = bool(form.find("input", {"type": "password"}))
-
-            if has_password and full_action.startswith("http://"):
-                self.add("WEB-FORM-001", "Password form submits over plain HTTP", "HIGH", "HIGH", "Forms",
-                          url, f"action={full_action}",
-                          "Credentials submitted over HTTP can be intercepted in transit.",
-                          "Serve the form and its action endpoint exclusively over HTTPS.")
-
-            if has_password:
-                pw_input = form.find("input", {"type": "password"})
-                autocomplete = (pw_input.get("autocomplete") or "").lower()
-                if autocomplete not in ("off", "new-password"):
-                    self.add("WEB-FORM-002", "Password field without restrictive autocomplete", "LOW", "LOW",
-                              "Forms", url, f"autocomplete={autocomplete or '(default)'}",
-                              "Browsers may store and auto-fill the password field on shared devices.",
-                              "Consider autocomplete='new-password' for registration/change-password forms.")
-
-            action_host = urlparse(full_action).hostname
-            if action_host and action_host != self.domain and action_host != f"www.{self.domain}":
-                self.add("WEB-FORM-003", "Form submits to an external domain", "MEDIUM", "MEDIUM", "Forms",
-                          url, f"action={full_action}",
-                          "Forms posting to a third-party domain can indicate injected content or unintended data exfiltration.",
-                          "Verify this is intentional; otherwise point the form action back to the application's own domain.")
-
-    def check_common_exposures(self):
-        findings_added = 0
-        for path, label in [("/robots.txt", "robots.txt"), ("/sitemap.xml", "sitemap.xml"),
-                             ("/.well-known/security.txt", "security.txt"), ("/security.txt", "security.txt")]:
-            for proto in ("https", "http"):
-                url = f"{proto}://{self.domain}{path}"
-                r = self.get(url)
-                if r is not None and r.status_code == 200:
-                    if label == "robots.txt":
-                        disallows = re.findall(r"Disallow:\s*(\S+)", r.text, re.IGNORECASE)
-                        interesting = [d for d in disallows if any(k in d.lower() for k in ["admin", "config", "backup", "private", "internal"])]
-                        if interesting:
-                            self.add("WEB-EXPOSE-001", "robots.txt reveals sensitive-looking paths", "LOW", "MEDIUM",
-                                      "Exposure", url, f"{len(interesting)} sensitive-looking Disallow entries",
-                                      "robots.txt is public and listing sensitive paths just points attackers at them.",
-                                      "Avoid listing sensitive paths in robots.txt; rely on proper authentication instead.")
-                    if label == "security.txt":
-                        findings_added += 1
-                    break
-
-    def check_directory_exposure(self):
-        sensitive_files = {"/.env": "Environment file", "/.git/config": "Git config", "/.git/HEAD": "Git repository",
-                            "/backup.zip": "Backup archive", "/dump.sql": "Database dump", "/database.sql": "Database dump"}
-        for path, label in sensitive_files.items():
-            for proto in ("https", "http"):
-                if not self.request_budget_left():
-                    return
-                url = f"{proto}://{self.domain}{path}"
-                r = self.get(url)
-                if r is not None and r.status_code == 200 and len(r.content) > 0:
-                    self.add("WEB-DIREXP-001", f"Sensitive file exposed: {label}", "HIGH", "MEDIUM", "Directory Exposure",
-                              url, "FOUND (content not retrieved)",
-                              f"{label} appears to be publicly accessible, which can leak credentials or source data.",
-                              "Remove or block public access to this file; rotate any credentials it may contain.")
-                    break
-
-    def check_api_discovery(self, crawled_urls, js_endpoints):
-        api_like = set()
-        for u in list(crawled_urls) + list(js_endpoints):
-            if re.search(r"(/api/|/graphql|/rest/|/v\d+/)", u):
-                api_like.add(u)
-        if api_like:
-            self.add("WEB-API-001", f"{len(api_like)} API-like endpoint(s) discovered", "INFO", "HIGH",
-                      "API Discovery", f"https://{self.domain}", list(api_like)[:10],
-                      "These endpoints may expose additional attack surface beyond the main web UI.",
-                      "Ensure all discovered API endpoints enforce authentication/authorization and input validation.")
-
-    def check_swagger(self):
-        paths = ["/swagger", "/swagger-ui", "/swagger.json", "/openapi.json", "/openapi.yaml", "/api-docs", "/v2/api-docs", "/v3/api-docs"]
-        for path in paths:
-            for proto in ("https", "http"):
-                if not self.request_budget_left():
-                    return
-                url = f"{proto}://{self.domain}{path}"
-                r = self.get(url)
-                if r is None or r.status_code != 200:
-                    continue
-                title = None
-                version = None
-                endpoint_count = None
-                try:
-                    data = r.json()
-                    info = data.get("info", {})
-                    title = info.get("title")
-                    version = info.get("version")
-                    endpoint_count = len(data.get("paths", {}))
-                except Exception:
-                    pass
-                self.add("WEB-SWAGGER-001", "API documentation publicly exposed", "MEDIUM", "HIGH",
-                          "API Documentation", url,
-                          f"title={title}, version={version}, endpoints={endpoint_count}",
-                          "Publicly reachable API docs reveal the full surface of internal endpoints and parameters to anyone.",
-                          "Restrict access to API documentation to authenticated/internal users, or remove it from production.")
-                return
-
-    def check_graphql(self):
-        for path in ("/graphql", "/api/graphql", "/v1/graphql"):
-            for proto in ("https", "http"):
-                if not self.request_budget_left():
-                    return
-                url = f"{proto}://{self.domain}{path}"
-                r = self.get(url)
-                if r is None:
-                    continue
-                if r.status_code in (400, 405) or "graphql" in r.text.lower() or "query" in r.text.lower():
-                    self.add("WEB-GRAPHQL-001", "GraphQL endpoint detected", "INFO", "MEDIUM", "GraphQL", url,
-                              f"HTTP {r.status_code}",
-                              "A GraphQL endpoint was found; if introspection is enabled it can expose the entire schema.",
-                              "Disable introspection in production and enforce query depth/complexity limits.")
-                    return
-
-    def run(self, mode="all", crawled_urls=None, js_endpoints=None):
-        crawled_urls = crawled_urls or []
-        js_endpoints = js_endpoints or []
-
-        run_headers = mode in ("all", "web", "headers")
-        run_tls = mode in ("all", "web", "tls")
-        run_cookies = mode in ("all", "web", "cookies")
-        run_cors = mode in ("all", "web", "cors")
-        run_api = mode in ("all", "web", "api")
-        run_crawler_dependent = mode in ("all", "web", "crawler", "api")
-
-        url, response = self.primary_response()
+    def check_methods_redirects(self, url):
+        response = self.get(url, method="OPTIONS")
         if response is not None:
-            if run_headers:
-                self.check_headers(url, response)
-                self.check_clickjacking(url, response)
-                self.check_csp_quality(url, response)
-                self.check_info_disclosure(url, response)
-                self.check_cache_security(url, response)
-                self.check_mixed_content(url, response)
-            if run_cookies:
-                self.check_cookies(url, response)
-            if run_headers or mode in ("all", "web"):
-                self.check_forms(url, response)
+            allow = response.headers.get("Allow", "")
+            dangerous = [item for item in allow.split(",")
+                         if item.strip().upper() in ("PUT", "DELETE", "TRACE", "CONNECT")]
+            if dangerous:
+                self.add("WEB-METHOD-001", "Potentially risky HTTP methods advertised", "MEDIUM",
+                         "MEDIUM", "HTTP Methods", url, f"Allow: {allow}",
+                         "Write or diagnostic methods may increase risk when not required.",
+                         "Disable unused methods and enforce authorization at each route.")
+        http_response = self.get(self.base_http, allow_redirects=False)
+        if http_response and http_response.status_code not in (301, 302, 303, 307, 308):
+            self.add("WEB-REDIRECT-001", "HTTP endpoint does not redirect to HTTPS", "MEDIUM",
+                     "HIGH", "Redirects", self.base_http, f"HTTP {http_response.status_code}",
+                     "Plain HTTP requests may remain unencrypted.",
+                     "Redirect HTTP to the equivalent HTTPS URL.")
+        elif http_response and http_response.headers.get("Location", "").startswith("https://"):
+            self.logger.info("HTTP-to-HTTPS redirect observed.")
 
-        if run_tls:
+    def run(self, mode="all", crawled_urls=None, js_endpoints=None,
+            traffic_check=False, injection_check=False,
+            crawl_pages=30, crawl_depth=2):
+        if mode == "traffic":
+            url, response = self.primary()
+            if response is not None:
+                self.check_waf_rate(url, response)
+            if traffic_check and url:
+                self.check_traffic(url)
+            score, label = risk_score(self.findings)
+            return {
+                "findings": self.findings, "risk_score": score, "risk_label": label,
+                "requests_used": self.manager.count, "elapsed": self.manager.elapsed,
+                "safe_stop": self.manager.stop_reason, "crawled_urls": [],
+                "scripts": [], "parameters": {}, "forms": [],
+            }
+        links, scripts, params, forms = discover_site(
+            self.domain, self.manager, self.logger,
+            max_pages=crawl_pages, max_depth=crawl_depth
+        ) if mode in ("all", "web", "crawler", "api") or self.active else ([], [], {}, [])
+        self.discovered_urls = links
+        self.discovered_params = params
+        global DISCOVERED_PARAMETERS
+        DISCOVERED_PARAMETERS = params
+        self.discovered_scripts = scripts
+        url, response = (None, None) if mode == "dns" else self.primary()
+        if response is not None:
+            self.check_waf_rate(url, response)
+            self.check_response_disclosure(url, response)
+            self.check_headers(url, response)
+            self.check_cookies(url, response)
+            self.check_content(url, response)
+            self.check_cors(url)
+        if mode in ("all", "web", "api", "crawler"):
+            self.check_api()
+            self.check_source_maps(scripts)
+            self.check_exposure()
+        if mode in ("all", "web", "tls"):
             self.check_tls()
-            self.check_http_methods(url or self.base_https)
-            self.check_redirects(self.base_http)
+            self.check_methods_redirects(url or self.base_https)
+        if mode in ("all", "web", "dns"):
+            self.check_dns()
+        if mode in ("all", "web", "crawler"):
+            login = next((item for item in links if LOGIN_PATTERN.search(urlparse(item).path)), None)
+            if login:
+                response = self.get(login)
+                if response and (
+                    response.status_code == 429 or response.headers.get("Retry-After")
+                    or any(key.lower().startswith(("ratelimit-", "x-ratelimit-"))
+                           for key in response.headers)
+                ):
+                    self.add("WEB-AUTH-002", "Login endpoint exposes throttle metadata",
+                             "INFO", "MEDIUM", "Authentication", login,
+                             f"HTTP {response.status_code}; Retry-After={response.headers.get('Retry-After', '(none)')}",
+                             "A passive request observed a rate-control signal; no credentials were submitted.",
+                             "Confirm login throttling and recovery controls in authorized operational tests.")
+        if traffic_check and url:
+            self.check_traffic(url)
+        if self.active:
+            self.check_active_inputs(params, injection=injection_check)
+        if self.manager.stop_reason:
+            self.add("WEB-SAFE-STOP-001", "Assessment stopped by a safety threshold", "INFO", "HIGH",
+                     "DoS Protection", url or self.base_https, self.manager.stop_reason,
+                     "LATENT stopped requests after a configured protective signal.",
+                     "Review service logs; resume testing only after an approved operational check.")
+        score, label = risk_score(self.findings)
+        return {
+            "findings": self.findings, "risk_score": score, "risk_label": label,
+            "requests_used": self.manager.count, "elapsed": self.manager.elapsed,
+            "safe_stop": self.manager.stop_reason,
+            "crawled_urls": links, "scripts": scripts, "parameters": params, "forms": forms,
+        }
 
-        if run_cors:
-            cors_findings = cors_check(self.domain, self.logger, self.session, self.limiter)
-            for cf in cors_findings:
-                self.add("WEB-CORS-001", cf["issue"], cf["severity"],
-                          "HIGH" if cf["severity"] in ("CRITICAL", "HIGH") else "MEDIUM",
-                          "CORS", cf["url"], f"Origin tested: {cf['origin']}",
-                          "Misconfigured CORS can allow malicious sites to read authenticated responses on behalf of a victim.",
-                          "Restrict Access-Control-Allow-Origin to a known allow-list and avoid combining wildcard with credentials.")
 
-        if mode in ("all", "web"):
-            self.check_common_exposures()
-            self.check_directory_exposure()
+def scan_ports(target, limit=1000, threads=30, logger=None):
+    logger = logger or Logger()
+    logger.phase("NETWORK / PORT DISCOVERY")
+    addresses = resolve_ips(target)
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        logger.warn("Port discovery refused an unresolved or non-public target.")
+        return []
+    ports = range(1, min(max(1, limit), 1000) + 1)
 
-        if run_api or run_crawler_dependent:
-            self.check_api_discovery(crawled_urls, js_endpoints)
-            self.check_swagger()
-            self.check_graphql()
+    def probe(port):
+        for address in addresses:
+            family = socket.AF_INET6 if ipaddress.ip_address(address).version == 6 else socket.AF_INET
+            sockaddr = (address, port, 0, 0) if family == socket.AF_INET6 else (address, port)
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(0.4)
+                    if connection.connect_ex(sockaddr) != 0:
+                        continue
+                    try:
+                        service = socket.getservbyport(port, "tcp")
+                    except OSError:
+                        service = "unknown"
+                    banner = ""
+                    if port in (21, 22, 25, 110, 143, 587):
+                        connection.settimeout(0.2)
+                        try:
+                            banner = connection.recv(128).decode("utf-8", "replace").strip()
+                        except OSError:
+                            pass
+                    return port, service, banner
+            except (OSError, ValueError):
+                continue
+        return None
 
-        score, label = compute_risk_score(self.findings)
-        return {"findings": self.findings, "risk_score": score, "risk_label": label, "requests_used": self.request_count}
+    found = []
+    with ThreadPoolExecutor(max_workers=min(max(1, threads), 20)) as pool:
+        futures = [pool.submit(probe, port) for port in ports]
+        for future in as_completed(futures):
+            item = future.result()
+            if item:
+                found.append(item)
+                logger.ok(f"OPEN {item[0]}/{item[1]}" + (f" | {item[2][:100]}" if item[2] else ""))
+    return sorted(found)
 
 
-def group_findings_by_severity(findings):
-    grouped = {s: [] for s in SEVERITY_ORDER}
-    for f in findings:
-        grouped.setdefault(f.get("severity", "INFO"), []).append(f)
-    return grouped
+def cors_check(domain, logger, session, limiter):
+    scope = {domain, f"www.{domain}"}
+    manager = REQUEST_MANAGER or RequestManager(session, logger, limiter, allowed_hosts=scope)
+    scanner = WebSecurityScanner(domain, logger, session, limiter)
+    scanner.manager = manager
+    url = scanner.base_https
+    return scanner.check_cors(url)
+
+
+def xss_probe(domain, logger, session, limiter):
+    scanner = WebSecurityScanner(domain, logger, session, limiter, active=True)
+    params = DISCOVERED_PARAMETERS
+    if not params:
+        _, _, params, _ = discover_site(domain, scanner.manager, logger)
+    scanner.check_active_inputs(params)
+    return [
+        {"url": finding["target"], "parameter": finding["evidence"].split("Parameter=", 1)[-1].split(";", 1)[0]}
+        for finding in scanner.findings if finding["id"] == "WEB-XSS-REFLECT-001"
+    ]
+
+
+def enumerate_subdomains(domain, wordlist, limit=50, logger=None):
+    logger = logger or Logger()
+    logger.phase("DISCOVERY / SUBDOMAINS")
+    found = []
+    try:
+        with open(wordlist, encoding="utf-8", errors="ignore") as stream:
+            names = [line.strip() for line in stream if line.strip() and not line.lstrip().startswith("#")]
+    except OSError as exc:
+        logger.warn(f"Subdomain wordlist unavailable: {exc}")
+        return found
+    names = names[:limit] if limit else names
+    for label in names:
+        candidate = f"{label}.{domain}"
+        addresses = resolve_ips(candidate)
+        if addresses and all(ipaddress.ip_address(item).is_global for item in addresses):
+            found.append((candidate, addresses))
+            logger.ok(f"{candidate} -> {', '.join(addresses)}")
+    return found
 
 
 def generate_html_report(data, domain, timestamp, logger=None):
+    esc = lambda value: html.escape(str(value), quote=True)
+    filename_domain = re.sub(r"[^A-Za-z0-9_.-]", "_", domain)
+    path = f"latent_report_{filename_domain}_{timestamp}.html"
+    findings = data.get("findings", data.get("web_findings", []))
+    rows = []
+    colors = {"CRITICAL": "#b42318", "HIGH": "#c4320a", "MEDIUM": "#b54708",
+              "LOW": "#027a48", "INFO": "#475467"}
+    for finding in findings:
+        severity = finding.get("severity", "INFO")
+        rows.append(
+            '<article class="finding">'
+            f'<span class="badge" style="background:{colors.get(severity, "#475467")}">{esc(severity)}</span> '
+            f'<strong>{esc(finding.get("id", ""))}: {esc(finding.get("title", ""))}</strong>'
+            f'<p><b>Category:</b> {esc(finding.get("category", ""))} | '
+            f'<b>Confidence:</b> {esc(finding.get("confidence", ""))}</p>'
+            f'<p><b>Target:</b> {esc(finding.get("target", ""))}</p>'
+            f'<p><b>Evidence:</b> {esc(finding.get("evidence", ""))}</p>'
+            f'<p><b>Description / impact:</b> {esc(finding.get("impact", finding.get("description", "")))}</p>'
+            f'<p><b>Remediation:</b> {esc(finding.get("remediation", ""))}</p></article>'
+        )
+    urls = "".join(f"<li>{esc(item)}</li>" for item in data.get("crawled_urls", []))
+    content = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>LATENT assessment — {esc(domain)}</title>
+<style>
+body{{font:16px system-ui,sans-serif;background:#f3f5f8;color:#182230;margin:0}}
+main{{max-width:1100px;margin:auto;padding:24px}} header,.card{{background:#fff;padding:22px;
+border-radius:12px;margin-bottom:18px;box-shadow:0 2px 8px #10182812}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}
+.finding{{background:#fff;padding:18px;margin:12px 0;border-left:4px solid #6172f3;
+border-radius:8px;overflow-wrap:anywhere}} .badge{{color:white;padding:4px 9px;border-radius:12px}}
+pre,li{{overflow-wrap:anywhere}} footer{{color:#667085;padding:20px}}
+</style></head><body><main><header><h1>LATENT Security Assessment</h1>
+<p>Target: <b>{esc(domain)}</b> | Generated: {esc(timestamp)}</p></header>
+<section class="grid"><div class="card"><b>Risk</b><h2>{esc(data.get("risk_score", 0))}/100</h2>
+{esc(data.get("risk_label", "LOW"))}</div><div class="card"><b>Findings</b><h2>{len(findings)}</h2></div>
+<div class="card"><b>Requests</b><h2>{esc(data.get("request_count", 0))}</h2></div>
+<div class="card"><b>Elapsed</b><h2>{esc(data.get("elapsed", 0))}s</h2></div></section>
+<section class="card"><h2>Safety</h2><p>Automatic stop: {esc(data.get("safe_stop") or "not triggered")}</p></section>
+<section><h2>Findings</h2>{''.join(rows) if rows else '<p>No findings recorded.</p>'}</section>
+<section class="card"><h2>Discovered URLs</h2><ul>{urls or '<li>None</li>'}</ul></section>
+<footer>For authorized, low-impact security assessments only.</footer></main></body></html>"""
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(content)
     if logger:
-        logger.phase("HTML REPORT GENERATION")
-
-    html_path = f"latent_report_{domain}_{timestamp}.html"
-
-    severity_colors = {
-        "CRITICAL": "#dc3545",
-        "HIGH": "#fd7e14",
-        "MEDIUM": "#ffc107",
-        "LOW": "#17a2b8",
-        "INFO": "#6c757d"
-    }
-
-    cors_html = ""
-    for finding in data.get("cors_findings", []):
-        color = severity_colors.get(finding.get("severity", "INFO"), "#6c757d")
-        cors_html += f"""
-        <div class="finding" style="border-left-color: {color}">
-            <span class="badge" style="background: {color}">{finding.get('severity', 'INFO')}</span>
-            <strong>{finding.get('issue', '')}</strong><br>
-            URL: {finding.get('url', '')}<br>
-            Origin tested: {finding.get('origin', '')}
-        </div>
-        """
-
-    jwt_html = ""
-    for finding in data.get("jwt_findings", []):
-        issues = finding.get("issues", [])
-        issues_str = ", ".join(issues) if issues else "None"
-        jwt_html += f"""
-        <div class="finding">
-            <strong>Algorithm:</strong> {finding.get('algorithm', 'unknown')}<br>
-            <strong>Token:</strong> {finding.get('token_preview', 'N/A')}<br>
-            <strong>Payload keys:</strong> {', '.join(finding.get('payload_keys', []))}<br>
-            <strong>Issues:</strong> <span style="color: {'#dc3545' if issues else '#28a745'}">{issues_str}</span>
-        </div>
-        """
-
-    screenshots_html = ""
-    for ss in data.get("screenshots", []):
-        screenshots_html += f"""
-        <div class="screenshot">
-            <h4>{ss.get('url', '')}</h4>
-            <img src="{ss.get('file', '')}" alt="Screenshot" style="max-width: 100%; border: 1px solid #ddd; border-radius: 4px;">
-        </div>
-        """
-
-    crawl_html = ""
-    for url in data.get("crawled_urls", [])[:50]:
-        crawl_html += f"<li>{url}</li>\n"
-
-    js_html = ""
-    for endpoint in data.get("js_endpoints", [])[:50]:
-        js_html += f"<li>{endpoint}</li>\n"
-
-    web_findings = data.get("web_findings", [])
-    grouped = group_findings_by_severity(web_findings)
-    risk_score = data.get("web_risk_score", 0)
-    risk_label = data.get("web_risk_label", "LOW")
-
-    def render_finding_group(items):
-        out = ""
-        for f in items:
-            color = severity_colors.get(f.get("severity", "INFO"), "#6c757d")
-            out += f"""
-            <div class="finding" style="border-left-color: {color}">
-                <span class="badge" style="background: {color}">{f.get('severity')}</span>
-                <span class="badge" style="background: #555">confidence: {f.get('confidence')}</span>
-                <strong>{f.get('title')}</strong><br>
-                <em>{f.get('category')}</em> — {f.get('target')}<br>
-                <strong>Evidence:</strong> {f.get('evidence')}<br>
-                <strong>Description:</strong> {f.get('description')}<br>
-                <strong>Remediation:</strong> {f.get('remediation')}
-            </div>
-            """
-        return out if out else "<p>None found.</p>"
-
-    web_findings_html = ""
-    for sev in SEVERITY_ORDER:
-        items = grouped.get(sev, [])
-        web_findings_html += f"<h3>{sev} ({len(items)})</h3>{render_finding_group(items)}"
-
-    html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LATENT Report - {domain}</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
-        .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
-        header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 40px 20px; text-align: center; border-radius: 8px; margin-bottom: 30px; }}
-        header h1 {{ font-size: 2.5em; margin-bottom: 10px; }}
-        header p {{ opacity: 0.9; font-size: 1.1em; }}
-        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }}
-        .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }}
-        .card h3 {{ color: #667eea; font-size: 2em; margin-bottom: 5px; }}
-        .card p {{ color: #666; font-size: 0.9em; }}
-        .section {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-        .section h2 {{ color: #667eea; border-bottom: 2px solid #667eea; padding-bottom: 10px; margin-bottom: 20px; }}
-        .section h3 {{ color: #555; margin: 15px 0 10px 0; }}
-        .finding {{ background: #f8f9fa; padding: 15px; margin: 10px 0; border-left: 4px solid #667eea; border-radius: 4px; }}
-        .badge {{ display: inline-block; padding: 3px 10px; border-radius: 12px; color: white; font-size: 0.75em; font-weight: bold; margin-right: 10px; }}
-        .screenshot {{ margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 4px; }}
-        .screenshot h4 {{ margin-bottom: 10px; color: #555; }}
-        .risk-banner {{ text-align: center; padding: 20px; border-radius: 8px; margin-bottom: 20px; font-size: 1.4em; font-weight: bold; color: white; }}
-        ul {{ list-style: none; padding-left: 0; }}
-        ul li {{ padding: 8px 0; border-bottom: 1px solid #eee; }}
-        ul li:before {{ content: ">"; color: #667eea; margin-right: 10px; }}
-        footer {{ text-align: center; padding: 20px; color: #666; margin-top: 30px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>LATENT</h1>
-            <p>Professional Web &amp; Network Security Assessment Toolkit</p>
-            <p style="margin-top: 10px; font-size: 0.9em;">Target: <strong>{domain}</strong> | Generated: {timestamp}</p>
-        </header>
-
-        <div class="risk-banner" style="background: {severity_colors.get(risk_label if risk_label in severity_colors else 'MEDIUM', '#667eea')}">
-            Risk Score: {risk_score}/100 — {risk_label}
-        </div>
-
-        <div class="summary">
-            <div class="card">
-                <h3>{len(data.get('open_ports', []))}</h3>
-                <p>Open Ports</p>
-            </div>
-            <div class="card">
-                <h3>{len(data.get('subdomains', []))}</h3>
-                <p>Subdomains</p>
-            </div>
-            <div class="card">
-                <h3>{data.get('xss_reflected', 0)}</h3>
-                <p>XSS Reflected</p>
-            </div>
-            <div class="card">
-                <h3>{len(data.get('directories', []))}</h3>
-                <p>Interesting Paths</p>
-            </div>
-            <div class="card">
-                <h3>{len(data.get('crawled_urls', []))}</h3>
-                <p>Crawled URLs</p>
-            </div>
-            <div class="card">
-                <h3>{len(web_findings)}</h3>
-                <p>Web Findings</p>
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>Executive Summary</h2>
-            <p>{len(grouped.get('CRITICAL', []))} critical, {len(grouped.get('HIGH', []))} high, {len(grouped.get('MEDIUM', []))} medium,
-            {len(grouped.get('LOW', []))} low and {len(grouped.get('INFO', []))} informational web security findings were identified for {domain}.</p>
-        </div>
-
-        <div class="section">
-            <h2>Web Security Findings</h2>
-            {web_findings_html}
-        </div>
-
-        <div class="section">
-            <h2>Technology Fingerprinting</h2>
-            <pre style="background: #f8f9fa; padding: 15px; border-radius: 4px; overflow-x: auto;">{json.dumps(data.get('technology', {}), indent=2)}</pre>
-        </div>
-
-        <div class="section">
-            <h2>Crawled URLs ({len(data.get('crawled_urls', []))})</h2>
-            <ul>{crawl_html if crawl_html else "<li>No URLs crawled</li>"}</ul>
-        </div>
-
-        <div class="section">
-            <h2>JavaScript Endpoints ({len(data.get('js_endpoints', []))})</h2>
-            <ul>{js_html if js_html else "<li>No endpoints found</li>"}</ul>
-        </div>
-
-        <div class="section">
-            <h2>Legacy CORS Findings ({len(data.get('cors_findings', []))})</h2>
-            {cors_html if cors_html else "<p>No CORS issues detected.</p>"}
-        </div>
-
-        <div class="section">
-            <h2>JWT Analysis ({len(data.get('jwt_findings', []))})</h2>
-            {jwt_html if jwt_html else "<p>No JWT tokens found or analyzed.</p>"}
-        </div>
-
-        <div class="section">
-            <h2>Screenshots ({len(data.get('screenshots', []))})</h2>
-            {screenshots_html if screenshots_html else "<p>No screenshots taken.</p>"}
-        </div>
-
-        <div class="section">
-            <h2>Open Ports</h2>
-            <ul>
-                {''.join([f"<li>Port {p[0]}/{p[1]}</li>" for p in data.get('open_ports', [])])}
-            </ul>
-        </div>
-
-        <div class="section">
-            <h2>Interesting Directories ({len(data.get('directories', []))})</h2>
-            <ul>
-                {''.join([f"<li>[{d[1]}] {d[0]} ({d[2]} bytes)</li>" for d in data.get('directories', [])])}
-            </ul>
-        </div>
-
-        <div class="section">
-            <h2>WHOIS Information</h2>
-            <pre style="background: #f8f9fa; padding: 15px; border-radius: 4px; overflow-x: auto;">{json.dumps(data.get('whois', {}), indent=2) if data.get('whois') else "No WHOIS data available."}</pre>
-        </div>
-
-        <div class="section">
-            <h2>Brute Force Candidates ({len(data.get('brute_candidates', []))})</h2>
-            <ul>
-                {''.join([f"<li>{c[1]}:{c[2]} @ {c[0]}</li>" for c in data.get('brute_candidates', [])]) if data.get('brute_candidates') else "<li>No candidates found</li>"}
-            </ul>
-        </div>
-
-        <div class="section">
-            <h2>Recommendations</h2>
-            <p>Address CRITICAL and HIGH findings first, then MEDIUM. Re-run the scan after remediation to confirm fixes.</p>
-        </div>
-
-        <footer>
-            <p>Generated by LATENT v{VERSION}</p>
-            <p style="font-size: 0.8em; margin-top: 5px;">For authorized testing only. Unauthorized use is illegal.</p>
-        </footer>
-    </div>
-</body>
-</html>"""
-
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    if logger:
-        logger.ok(f"HTML report generated: {html_path}")
-
-    return html_path
+        logger.ok(f"HTML report: {path}")
+    return path
 
 
 def build_report(data, path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, default=str)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False, default=str)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="LATENT - Professional Web & Network Security Assessment Toolkit",
-                                      epilog="Example: latent -t example.com --all")
-    parser.add_argument("-t", "--target", required=True, help="Target domain or URL")
-    parser.add_argument("-w", "--wordlist", default="subdomains.txt", help="Subdomain/wordlist path")
-    parser.add_argument("-p", "--ports", type=int, default=1000, help="Max port to scan (default: 1000)")
-    parser.add_argument("--threads", type=int, default=150, help="Port scan thread count (default: 150)")
-    parser.add_argument("--sub-limit", type=int, default=50, help="Subdomain limit (0=all) (default: 50)")
-    parser.add_argument("--rate", type=float, default=0.3, help="Inter-request delay in seconds (default: 0.3)")
-    parser.add_argument("--brute", action="store_true", help="Enable login brute-force")
-    parser.add_argument("--sqlmap", action="store_true", help="Enable SQLMap integration")
-    parser.add_argument("--json", action="store_true", help="Emit JSON report alongside TXT")
-    parser.add_argument("--html", action="store_true", help="Generate HTML report")
-    parser.add_argument("--screenshot", action="store_true", help="Take screenshots with Playwright")
-    parser.add_argument("--crawl-depth", type=int, default=2, help="Max crawl depth (default: 2)")
-    parser.add_argument("--crawl-pages", type=int, default=50, help="Max pages to crawl (default: 50)")
-    parser.add_argument("--web", action="store_true", help="Run the full web security engine")
-    parser.add_argument("--headers", action="store_true", help="Run only header/CSP/clickjacking checks")
-    parser.add_argument("--tls", action="store_true", help="Run only TLS checks")
-    parser.add_argument("--cookies", action="store_true", help="Run only cookie checks")
-    parser.add_argument("--cors", action="store_true", help="Run only CORS checks")
-    parser.add_argument("--api", action="store_true", help="Run only API/Swagger/GraphQL discovery")
-    parser.add_argument("--crawler", action="store_true", help="Run crawler-dependent web checks")
-    parser.add_argument("--all", action="store_true", help="Run every phase (network + web)")
-    parser.add_argument("--active", action="store_true", help="Allow more intrusive checks (still non-destructive)")
-    parser.add_argument("--max-requests", type=int, default=300, help="Max requests the web scanner may issue (default: 300)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
-    args = parser.parse_args()
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="LATENT — authorized low-impact security assessment"
+    )
+    parser.add_argument("-t", "--target", required=True, help="Target hostname or URL")
+    parser.add_argument("-w", "--wordlist", default="subdomains.txt")
+    parser.add_argument("-p", "--ports", type=int, default=1000)
+    parser.add_argument("--threads", type=int, default=30)
+    parser.add_argument("--sub-limit", type=int, default=50)
+    parser.add_argument("--rate", type=float, default=0.3)
+    parser.add_argument("--max-requests", type=int, default=300)
+    parser.add_argument("--crawl-depth", type=int, default=2)
+    parser.add_argument("--crawl-pages", type=int, default=30)
+    for flag in ("web", "all", "headers", "tls", "cookies", "cors", "api", "crawler", "dns"):
+        parser.add_argument(f"--{flag}", action="store_true")
+    parser.add_argument("--active", action="store_true",
+                        help="Test harmless reflection markers on discovered parameters")
+    parser.add_argument("--injection", action="store_true",
+                        help="Opt in to limited harmless quote-marker checks; requires --active")
+    parser.add_argument("--traffic-check", action="store_true",
+                        help="At most two paced GET observations; stops on throttling")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--html", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    if args.injection and not args.active:
+        parser.error("--injection requires --active")
+    if args.max_requests < 1 or args.ports < 1 or args.ports > 10000:
+        parser.error("--max-requests must be positive and --ports must be between 1 and 10000")
+    try:
+        target = normalize_target(args.target)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not is_public_target(target):
+        parser.error("Refusing unresolved or non-public targets (SSRF safety policy).")
 
-    domain = resolve_domain(args.target)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_txt = f"latent_report_{domain}_{ts}.txt"
-    report_json = f"latent_report_{domain}_{ts}.json"
-
-    print(f"{'='*70}")
-    print(f"                     LATENT | PROBE v{VERSION}")
-    print(f"                         discord : @saintlatent")
-    print(f"{'='*70}")
-
-    web_modes = {"web": args.web, "headers": args.headers, "tls": args.tls, "cookies": args.cookies,
-                 "cors": args.cors, "api": args.api, "crawler": args.crawler}
-    any_web_mode = any(web_modes.values()) or args.all
-    focused_mode = next((name for name, flag in web_modes.items() if flag), None)
-
-    with open(report_txt, "w", encoding="utf-8") as rf:
-        logger = Logger(rf, verbose=args.verbose)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", target)
+    txt_path = f"latent_report_{stem}_{stamp}.txt"
+    json_path = f"latent_report_{stem}_{stamp}.json"
+    global REQUEST_MANAGER
+    with open(txt_path, "w", encoding="utf-8") as report_file:
+        logger = Logger(report_file, args.verbose)
         session = requests.Session()
-        session.headers.update(HEADERS)
         limiter = RateLimiter(args.rate)
+        scope = {target}
+        try:
+            ipaddress.ip_address(target)
+        except ValueError:
+            scope.add(f"www.{target}")
+        REQUEST_MANAGER = RequestManager(
+            session, logger, limiter, args.max_requests, allowed_hosts=scope
+        )
+        configure_http_manager(REQUEST_MANAGER)
+        logger.manager = REQUEST_MANAGER
+        logger.info(f"Target: {target}")
+        logger.info(f"Request budget: {args.max_requests}; minimum interval: {limiter.delay:.1f}s")
 
-        logger.log(f"Target: {domain}")
-        logger.log(f"Wordlist: {args.wordlist}")
-        logger.log(f"MaxPort: {args.ports} | Threads: {args.threads} | Rate: {args.rate}s")
+        run_web = any((
+            args.web, args.all, args.headers, args.tls, args.cookies,
+            args.cors, args.api, args.crawler, args.dns, args.active,
+            args.injection, args.traffic_check,
+        ))
+        run_network = args.all or not run_web
+        ports, subdomains = [], []
+        if run_network:
+            logger.phase("NETWORK")
+            if not is_public_target(target):
+                logger.error("Target no longer resolves to a public address; aborting.")
+                return 2
+            ports = scan_ports(target, args.ports, args.threads, logger)
+            if not re.fullmatch(r"[0-9a-fA-F:.]+", target):
+                subdomains = enumerate_subdomains(target, args.wordlist, args.sub_limit, logger)
 
-        if not ssrf_guard(domain, logger):
-            logger.error("Target resolves to a private/internal address. Aborting for safety.")
-            print("\n[!] Refusing to scan a private/internal target.")
-            return
-
-        html, html_path, tech = None, None, {}
-        open_ports, smb_data, found_subs = [], None, []
-        xss_hits, dirs, whois_data = 0, [], None
-        sqlmap_result, brute_results = False, []
-        crawled_urls, js_endpoints, secret_hits = [], [], 0
-        cors_findings, jwt_findings, screenshots = [], [], []
-        web_result = {"findings": [], "risk_score": 0, "risk_label": "LOW", "requests_used": 0}
-
-        run_network_phase = args.all or not any_web_mode
-
-        if run_network_phase:
-            try:
-                html, html_path, tech = fetch_html(domain, logger, session)
-            except Exception as e:
-                logger.error(f"HTML fetch failed: {e}")
-
-            try:
-                open_ports = scan_ports(domain, args.ports, logger, args.threads)
-            except Exception as e:
-                logger.error(f"Port scan failed: {e}")
-
-            try:
-                smb_data = smb_probe(domain, logger)
-            except Exception as e:
-                logger.error(f"SMB probe failed: {e}")
-
-            try:
-                if aiodns:
-                    found_subs = asyncio.run(subdomain_async(domain, args.wordlist, logger, args.sub_limit))
-                else:
-                    found_subs = subdomain_sync(domain, args.wordlist, logger, args.sub_limit)
-            except Exception as e:
-                logger.error(f"Subdomain enum failed: {e}")
-
-            if args.active:
-                try:
-                    xss_hits = xss_probe(domain, logger, session, limiter)
-                except Exception as e:
-                    logger.error(f"XSS probe failed: {e}")
-
-            try:
-                dirs = dir_fuzz(domain, logger, session, limiter)
-            except Exception as e:
-                logger.error(f"Dir fuzz failed: {e}")
-
-            try:
-                whois_data = whois_lookup(domain, logger)
-            except Exception as e:
-                logger.error(f"WHOIS lookup failed: {e}")
-
-            if args.sqlmap and args.active:
-                try:
-                    sqlmap_result = sqlmap_probe(domain, logger)
-                except Exception as e:
-                    logger.error(f"SQLMap failed: {e}")
-
-            if args.brute and args.active:
-                try:
-                    brute_results = brute_login(domain, args.wordlist, logger, session, limiter)
-                except Exception as e:
-                    logger.error(f"Brute force failed: {e}")
-        else:
-            try:
-                html, html_path, tech = fetch_html(domain, logger, session)
-            except Exception as e:
-                logger.error(f"HTML fetch failed: {e}")
-
-        need_crawl = args.all or focused_mode in ("crawler", "api", "web", None) or args.web
-        if need_crawl:
-            try:
-                crawled_urls = recursive_crawl(domain, logger, session, limiter, args.crawl_depth, args.crawl_pages)
-            except Exception as e:
-                logger.error(f"Crawler failed: {e}")
-
-            try:
-                js_endpoints, secret_hits = extract_js_endpoints(domain, logger, session, limiter, crawled_urls)
-            except Exception as e:
-                logger.error(f"JS endpoint extraction failed: {e}")
-
-        if run_network_phase:
-            try:
-                cors_findings = cors_check(domain, logger, session, limiter)
-            except Exception as e:
-                logger.error(f"CORS check failed: {e}")
-
-            try:
-                jwt_findings = jwt_analyze(domain, logger, session, limiter)
-            except Exception as e:
-                logger.error(f"JWT analysis failed: {e}")
-
-            if args.screenshot:
-                try:
-                    screenshots = take_screenshots(domain, logger, crawled_urls)
-                except Exception as e:
-                    logger.error(f"Screenshot failed: {e}")
-
-        if any_web_mode:
-            try:
-                scanner = WebSecurityScanner(domain, logger, session=session, limiter=limiter,
-                                              active=args.active, max_requests=args.max_requests)
-                mode = focused_mode or "all"
-                web_result = scanner.run(mode=mode, crawled_urls=crawled_urls, js_endpoints=js_endpoints)
-            except Exception as e:
-                logger.error(f"Web security engine failed: {e}")
-
+        mode = (
+            "traffic" if args.traffic_check and not any((
+                args.all, args.web, args.headers, args.tls, args.cookies,
+                args.cors, args.api, args.crawler, args.dns, args.active, args.injection,
+            )) else
+            "all" if args.all or args.web else next(
+            (name for name in ("headers", "tls", "cookies", "cors", "api", "crawler", "dns")
+             if getattr(args, name)), "all"
+            )
+        )
+        scanner = WebSecurityScanner(
+            target, logger, session, limiter, active=args.active,
+            max_requests=args.max_requests,
+        )
+        result = scanner.run(
+            mode=mode, traffic_check=args.traffic_check,
+            injection_check=args.injection,
+            crawl_pages=args.crawl_pages, crawl_depth=args.crawl_depth,
+        )
+        findings = result["findings"]
+        score, label = risk_score(findings)
         summary = {
-            "target": domain,
-            "timestamp": ts,
-            "version": VERSION,
-            "html_saved": html_path,
-            "technology": tech,
-            "open_ports": open_ports,
-            "smb_shares": smb_data,
-            "subdomains": found_subs,
-            "xss_reflected": xss_hits,
-            "directories": dirs,
-            "whois": whois_data,
-            "sqlmap_vulnerable": sqlmap_result,
-            "brute_candidates": brute_results,
-            "crawled_urls": crawled_urls,
-            "js_endpoints": js_endpoints,
-            "js_secret_hits": secret_hits,
-            "cors_findings": cors_findings,
-            "jwt_findings": jwt_findings,
-            "screenshots": screenshots,
-            "web_findings": web_result["findings"],
-            "web_risk_score": web_result["risk_score"],
-            "web_risk_label": web_result["risk_label"],
-            "web_requests_used": web_result["requests_used"],
+            "target": target,
+            "timestamp": stamp,
+            "risk_score": score,
+            "risk_label": label,
+            "findings": findings,
+            "open_ports": ports,
+            "subdomains": subdomains,
+            "crawled_urls": result["crawled_urls"],
+            "scripts": result["scripts"],
+            "parameters": result["parameters"],
+            "forms": result["forms"],
+            "request_count": REQUEST_MANAGER.count,
+            "request_budget": REQUEST_MANAGER.budget,
+            "elapsed": round(REQUEST_MANAGER.elapsed, 2),
+            "safe_stop": REQUEST_MANAGER.stop_reason,
+            "status_codes": dict(REQUEST_MANAGER.status_codes),
             "errors": logger.errors,
-            "warnings": logger.warnings
+            "warnings": logger.warnings,
         }
-
         if args.json:
-            try:
-                build_report(summary, report_json)
-                logger.ok(f"JSON report: {report_json}")
-            except Exception as e:
-                logger.error(f"JSON report failed: {e}")
-
+            build_report(summary, json_path)
+            logger.ok(f"JSON report: {json_path}")
         if args.html:
-            try:
-                html_report_path = generate_html_report(summary, domain, ts, logger=logger)
-                logger.ok(f"HTML report: {html_report_path}")
-            except Exception as e:
-                logger.error(f"HTML report failed: {e}")
-
-        logger.phase("SUMMARY")
-        logger.ok(f"Open Ports: {len(open_ports)}")
-        logger.ok(f"Subdomains: {len(found_subs)}")
-        logger.ok(f"Crawled URLs: {len(crawled_urls)}")
-        logger.ok(f"JS Endpoints: {len(js_endpoints)}")
-        logger.ok(f"Web Findings: {len(web_result['findings'])}")
-        logger.ok(f"Web Risk Score: {web_result['risk_score']}/100 ({web_result['risk_label']})")
-        logger.ok(f"TXT Report: {report_txt}")
-
-        if logger.errors:
-            logger.warn(f"Total errors: {len(logger.errors)}")
-        if logger.warnings:
-            logger.warn(f"Total warnings: {len(logger.warnings)}")
-
-    print(f"\n[*] Done. Report: {report_txt}")
+            generate_html_report(summary, target, stamp, logger)
+        logger.phase("FINDINGS")
+        logger.ok(f"Findings: {len(findings)} | Risk: {score}/100 ({label})")
+        logger.ok(f"Requests: {REQUEST_MANAGER.count}/{REQUEST_MANAGER.budget}")
+        logger.ok(f"Elapsed: {REQUEST_MANAGER.elapsed:.1f}s")
+        logger.info(f"Safe stop: {REQUEST_MANAGER.stop_reason or 'not triggered'}")
+        logger.ok(f"Text report: {txt_path}")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
-        print("\n[!] Interrupted by user.")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n[!] Fatal: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+        print("\n[!] Interrupted.")
+        sys.exit(130)
