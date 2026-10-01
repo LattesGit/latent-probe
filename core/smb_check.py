@@ -1,39 +1,21 @@
-import socket
-import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from Latent.http_client import probe_tcp_port
 from core.logger import log
 from core.report import write_report
 
+
 def smb_check(domain, report):
-    ports = [139, 445]
     found = []
-
-    for port in ports:
-        try:
-            s = socket.socket()
-            s.settimeout(2)
-
-            if s.connect_ex((domain, port)) == 0:
-                log(f"SMB OPEN {port}")
-                write_report(report, f"SMB {port} OPEN")
-                found.append(port)
-
-            s.close()
-        except:
-            pass
-
+    for port in (139, 445):
+        if probe_tcp_port(domain, port, timeout=0.5):
+            found.append(port)
+            message = f"SMB service port {port}/tcp is reachable; no share enumeration performed."
+            log(message, "INFO")
+            write_report(report, message)
     if not found:
-        write_report(report, "No SMB found")
-        return
-
-    try:
-        result = subprocess.run(
-            ["smbclient", "-L", f"//{domain}/", "-N"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        write_report(report, result.stdout)
-
-    except:
-        write_report(report, "smbclient failed")
+        write_report(report, "No SMB ports observed.")
+    return found
